@@ -6,6 +6,8 @@ members = [
     "src/chat",
     "src/cmd",
     "src/engine-core-client",
+    "src/kv-hash",
+    "src/kv-pool",
     "src/llm",
     "src/managed-engine",
     "src/metrics",

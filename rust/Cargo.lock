@@ -5855,6 +5855,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vllm-kv-hash"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+]
+
+[[package]]
+name = "vllm-kv-pool"
+version = "0.1.0"
+
+[[package]]
 name = "vllm-llm"
 version = "0.1.0"
 dependencies = [

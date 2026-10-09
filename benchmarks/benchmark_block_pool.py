@@ -14,7 +14,11 @@ def main(args):
     for allocate_block in args.allocate_blocks:
         # Enforce a GC collect ahead to minimize the impact among runs
         gc.collect()
-        block_pool = BlockPool(num_gpu_blocks=args.num_gpu_blocks, enable_caching=True)
+        block_pool = BlockPool(
+            num_gpu_blocks=args.num_gpu_blocks,
+            enable_caching=True,
+            hash_block_size=args.block_size,
+        )
 
         get_blocks_times = TimeCollector(TimeCollector.US)
         free_blocks_times = TimeCollector(TimeCollector.US)
@@ -65,6 +69,12 @@ def invoke_main() -> None:
         nargs="*",
         default=[10, 50, 100, 500, 1000],
         help="Number of blocks to allocate",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=32,
+        help="Tokens per hash block, matching BlockPool(hash_block_size=...).",
     )
     args = parser.parse_args()
     main(args)
