@@ -157,6 +157,9 @@ Python, which covers the "py_compile <changed-python-files>" step:
   between the Rust re-implementation and the Python original, plus the shadow verification of
   the KV-cache block pool and its block-size-aware hash view, and why it is an architecture
   change rather than a speedup.
+- [Startup timeline](docs/startup-timeline.md) — where the ~53 s of startup actually goes:
+  what the engine measures itself, what only shows up as silence in the log, and the caveats of
+  reading a log written by two processes.
 
 ## 🧭 Profiles
 

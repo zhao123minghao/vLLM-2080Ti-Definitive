@@ -4,6 +4,28 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ## Unreleased
 
+### Startup timeline
+
+"Startup takes ~53 s" was measured but never explained; the launcher run log already holds both
+halves of the answer, so a new report reads it back:
+
+- New `tools/startup_timeline.py` prints the durations the **engine measured itself** (keeping
+  the slowest occurrence per phase and how often it was logged, since every worker of a
+  data-parallel run reports its own), a wall-clock milestone timeline built from the `MM-DD
+  HH:MM:SS` on each line against the `Launch time:` header, the phases that have no engine-side
+  measurement at all, and the largest gaps between log lines.
+- Measured on the reference route (warm AOT cache): engine ready at +50 s against the launcher's
+  `Startup complete after 54s`; the engine's own numbers are `init engine` 8.51 s (compilation
+  0.95 s), `Model loading` 7.42 s, `Loading weights` 3.44 s, warmup 1.38 s, graph capture 1.00 s
+  x4, `torch.compile` 0.85 s (AOT hit). The first ~18 s belong to the frontend spawn and the
+  Python import path, and the 22 s between `core.py:123` and the first weight-loading line are
+  distributed setup, KV cache allocation and worker coordination — none of which the engine
+  times. That is also why the lazy-import work moves the import phase, not this one; the report
+  says so instead of implying the 53 s are engine compute.
+- Documented in `docs/startup-timeline.md`, including the caveats the tool prints itself: one
+  second timestamp resolution, two processes writing the log, progress lines without any
+  timestamp, and the launcher's own `Startup complete` line being terminal-only.
+
 ### Dependency audit in the one-command validator
 
 The audit step of the publishing checklist is now part of the one-command validator, and the

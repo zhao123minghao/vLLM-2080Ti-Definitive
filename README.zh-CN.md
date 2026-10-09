@@ -144,6 +144,8 @@ Python 文件参与编译，因此可覆盖 AGENTS.md 里的
 - [v1/core Rust 迁移](docs/v1-core-rust-migration.zh-CN.md) —— Rust 重写与 Python 原版的逐字节
   前缀哈希一致性，以及 KV 缓存块池与其块大小感知哈希视图的影子校验，以及为什么它属于架构改变
   而非性能提升。
+- [启动时间线](docs/startup-timeline.zh-CN.md) —— ~53s 的启动时间实际花在哪：引擎自己测到的部分、
+  只表现为日志沉默的部分，以及读一份由两个进程写入的日志时的口径限制。
 
 ## 🧭 Profile 与推荐路线
 
