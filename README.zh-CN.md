@@ -118,6 +118,32 @@ NON_INTERACTIVE=1 ./launcher.sh
 使用 `./launcher.sh --print-config` 预览路线。自动化部署见
 [非交互启动说明](docs/non-interactive-launch.zh-CN.md)。
 
+## ✅ 校验
+
+发布前，以及改动 kernel、量化、parser 或 scheduler 后，按需运行：
+
+```bash
+bash tools/validate_all.sh                 # 静态检查：bash -n、py_compile、profile 矩阵、空白字符
+bash tools/validate_all.sh --with-parity   # 另加跨语言一致性（前缀哈希、块簿记）
+bash tools/validate_all.sh --with-chat     # 另加真实路由上的对话回归
+bash tools/validate_all.sh --full          # 以上全部
+```
+
+`--with-chat` 会自己启停参考路由，因此全量运行需要占用 GPU 且约三分钟（热启动约 53s）。每个工具
+都会打印便于 grep 的末行（`validate_all_ok ...`、`profile_validation_ok ...`、
+`chat_smoke_ok ...`、`prefix_hash_parity_ok ...`），失败时返回非零退出码。额外传入的参数会作为
+Python 文件参与编译，因此可覆盖 AGENTS.md 里的
+“py_compile <changed-python-files>”步骤：
+`bash tools/validate_all.sh --with-chat vllm/entrypoints/chat_utils.py`。
+
+- [对话回归](docs/chat-regression.zh-CN.md) —— 对话链路的正确性，以及本前端的接口契约
+  （`message.reasoning`、默认开启思考、流式 usage、`max_tokens` 计入思考 token）。
+- [依赖审计](docs/dependency-audit.zh-CN.md) —— 真实服务实际导入/映射了什么，以及实测得到的
+  固定版本清单 `requirements/definitive-2080ti-measured.txt`。
+- [v1/core Rust 迁移](docs/v1-core-rust-migration.zh-CN.md) —— Rust 重写与 Python 原版的逐字节
+  前缀哈希一致性，以及 KV 缓存块簿记的影子校验（9,030 步记录操作，含被拒绝的路径），以及
+  为什么它属于架构改变而非性能提升。
+
 ## 🧭 Profile 与推荐路线
 
 目录结构和路线字段请参阅 [Profile 指南](profiles/README.zh-CN.md)；详细 Profile

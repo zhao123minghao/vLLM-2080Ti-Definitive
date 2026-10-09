@@ -127,6 +127,36 @@ NON_INTERACTIVE=1 ./launcher.sh
 Use `./launcher.sh --print-config` to preview a route. See the
 [non-interactive launch guide](docs/non-interactive-launch.md) for automation.
 
+## ✅ Validation
+
+Before publishing, and after any change to kernels, quantization, the parser or the
+scheduler, run the checks that apply:
+
+```bash
+bash tools/validate_all.sh                 # static: bash -n, py_compile, profile matrix, whitespace
+bash tools/validate_all.sh --with-parity   # + cross-language parity (prefix hash, block pool)
+bash tools/validate_all.sh --with-chat     # + chat regression on a live route
+bash tools/validate_all.sh --full          # everything above
+```
+
+`--with-chat` starts the reference route itself and stops it again, so a full run needs the
+GPUs and takes about three minutes (a warm start is ~53 s). Each tool prints a grep-friendly
+last line (`validate_all_ok ...`, `profile_validation_ok ...`, `chat_smoke_ok ...`,
+`prefix_hash_parity_ok ...`) and exits non-zero on failure. Extra arguments are compiled as
+Python, which covers the "py_compile <changed-python-files>" step:
+`bash tools/validate_all.sh --with-chat vllm/entrypoints/chat_utils.py`.
+
+- [Chat regression](docs/chat-regression.md) — correctness of the served chat path, plus the
+  API contract of this frontend (`message.reasoning`, thinking on by default, usage in
+  streaming, `max_tokens` counting reasoning tokens).
+- [Dependency audit](docs/dependency-audit.md) — what a running service actually imports and
+  maps, measured from a real launch, and the measured pin set in
+  `requirements/definitive-2080ti-measured.txt`.
+- [v1/core Rust migration](docs/v1-core-rust-migration.md) — byte-exact prefix-hash parity
+  between the Rust re-implementation and the Python original, plus the shadow verification of
+  the KV-cache block bookkeeping (9,030 recorded operations, rejections included), and why it
+  is an architecture change rather than a speedup.
+
 ## 🧭 Profiles
 
 Read the [Profile Guide](profiles/README.md) for the layout and route fields.

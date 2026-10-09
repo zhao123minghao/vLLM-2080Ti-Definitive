@@ -58,6 +58,56 @@ python3 -m py_compile <changed-python-files>
 git diff --check
 ```
 
+`tools/validate_all.sh` runs exactly those four steps in one command and can pull in the two
+optional checks below:
+
+```bash
+bash tools/validate_all.sh                 # the four static steps above
+bash tools/validate_all.sh --with-parity   # + the cross-language parity checks
+bash tools/validate_all.sh --with-chat     # + the chat regression
+bash tools/validate_all.sh --full          # all of them
+```
+
+Extra non-option arguments are compiled as Python, which is how the
+`py_compile <changed-python-files>` step is meant to be used:
+
+```bash
+bash tools/validate_all.sh --with-chat vllm/entrypoints/chat_utils.py
+```
+
+For changes under `tools/` that touch prefix-cache hashing, or for changes under
+`rust/src/kv-hash`, also run the cross-language parity check. It builds the crate, runs the
+crate's own unit tests, and then diffs the Rust implementation against Python:
+
+```bash
+bash tools/check_prefix_hash_parity.sh
+```
+
+For changes under `rust/src/kv-pool`, or to the block bookkeeping in
+`vllm/v1/core/kv_cache_utils.py` and `vllm/v1/core/block_pool.py`, run the shadow
+verification the same way: Python records a random operation trace and the Rust port has to
+replay it into an identical log, including the operations Python rejects.
+
+```bash
+bash tools/check_block_pool_parity.sh
+```
+
+For changes to model code, kernels, quantization, or the parser/serving path, also run the
+chat regression against a live route (it starts and stops the reference route itself):
+
+```bash
+bash tools/chat_smoke.sh --launch --quick
+```
+
+For dependency, requirement or environment changes (adding, pruning or replacing packages),
+re-run the audit and check the measured pin set against it; `check_minimal_set.py` fails when
+a distribution the run loaded is missing from the pin file:
+
+```bash
+bash tools/dep_audit.sh --out-dir /tmp/dep-audit -- <launcher args...>
+python3 tools/dep_audit/check_minimal_set.py --report /tmp/dep-audit/report.json
+```
+
 For launcher/profile changes, also verify `launcher.sh --print-config` for the
 affected route and mode. For runtime kernel or graph-policy changes, include a
 real benchmark or smoke result that proves the changed path still works.
