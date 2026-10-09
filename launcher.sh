@@ -77,6 +77,42 @@ current_service_info() {
   return 1
 }
 
+port_is_listening() {
+  local host=$1
+  local port=$2
+
+  [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
+  # Probe from a subshell so a refused connection cannot leak shell diagnostics
+  # into the launcher output, and so no fd is left open on success.
+  ( exec 9<>"/dev/tcp/${host}/${port}" ) 2>/dev/null
+}
+
+refuse_duplicate_start() {
+  local host=$1
+  local port=$2
+  local info pid name
+
+  [[ "${ALLOW_DUPLICATE_START:-0}" == "1" ]] && return 0
+
+  if info=$(current_service_info); then
+    IFS=$'\t' read -r _ pid name <<< "$info"
+    echo "ERROR: a managed vLLM service is already running (name=$name, pid=$pid)." >&2
+    echo "  Starting another instance would reuse the running server's /health check" >&2
+    echo "  and be reported as a successful start. Stop it first, or set" >&2
+    echo "  ALLOW_DUPLICATE_START=1 to start anyway." >&2
+    return 1
+  fi
+
+  if port_is_listening 127.0.0.1 "$port"; then
+    echo "ERROR: port ${port} is already in use, so the new server cannot bind it." >&2
+    echo "  The health check would otherwise succeed against the existing listener and" >&2
+    echo "  report a false successful start. Free the port, choose another one with" >&2
+    echo "  --port, or set ALLOW_DUPLICATE_START=1 to start anyway." >&2
+    return 1
+  fi
+  return 0
+}
+
 pid_arg_value() {
   local pid=$1
   local flag=$2
@@ -307,6 +343,18 @@ normalize_bool() {
   case "${1,,}" in
     1|yes|y|true|on) echo 1 ;;
     *) echo 0 ;;
+  esac
+}
+
+normalize_frontend_kind() {
+  case "${1,,}" in
+    ""|auto) echo auto ;;
+    python|py) echo python ;;
+    rust|rs) echo rust ;;
+    *)
+      echo "ERROR: FRONTEND must be auto, python or rust (got: $1)." >&2
+      return 1
+      ;;
   esac
 }
 
@@ -901,6 +949,9 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   STATE_FILE
   FLASHQLA_ROOT
   START_TIMEOUT
+  ALLOW_DUPLICATE_START
+  PREWARM_COMPILE_ONLY
+  FRONTEND
   MM_IMAGE_LIMIT
   MM_LIMIT_JSON
   CUDA_HOME
@@ -939,6 +990,8 @@ NON_INTERACTIVE_BOOLEAN_KEYS=(
   VLLM_INT8KV_FA_PREFILL
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH
   SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION
+  ALLOW_DUPLICATE_START
+  PREWARM_COMPILE_ONLY
 )
 
 declare -A CONFIG_FLAG_TO_KEY=()
@@ -2797,6 +2850,20 @@ Notes:
     Use HF_ENDPOINT or HF_DOWNLOAD_ROUTE_MODE=official|mirror to pin a route.
   - Non-interactive precedence is CLI > ENV > PROFILE > default.
   - --print-config prints the final launch summary and exits without starting.
+  - Starting while a managed service runs, or while the target port is already
+    in use, is refused: the /health check would otherwise pass against the
+    existing listener and report a false successful start. Set
+    ALLOW_DUPLICATE_START=1 to start anyway.
+  - --prewarm-compile-only starts the resolved route, waits for /health so the
+    graph capture and compile cache are written, stops the server, and exits.
+    Use it once after changing profile, context, or KV precision so the next
+    real start reuses the compiled graph instead of recompiling it.
+  - --frontend selects the serving frontend: auto (default) picks rust for
+    text-only and text+image routes, with no speculative decoding or the
+    validated mtp/dflash methods (including per-request spec-decode metrics),
+    and without tool calling, SSD prefix caching, or scale-out endpoints;
+    rust/python force one. The Rust frontend removes the Python frontend
+    process from startup.
 EOF
   echo
   pause_enter
@@ -4012,6 +4079,49 @@ clear_last_service_state() {
   LAST_SMOKE_OUTPUT=""
   clear_startup_performance_state
   save_manager_state
+}
+
+compile_cache_report_from_log() {
+  local log_file=$1
+  local aot times
+
+  [[ -s "$log_file" ]] || return 1
+  # Runtime logs are hard-wrapped, so match against a flattened copy.
+  if tr -d '\r\n' <"$log_file" | grep -aq 'Directly load AOT compilation'; then
+    aot=yes
+  else
+    aot=no
+  fi
+  times=$(tr -d '\r\n' <"$log_file" |
+    grep -aoE 'torch\.compile took [0-9.]+ s in total' |
+    sed -E 's/^torch\.compile took ([0-9.]+) s in total$/\1/' |
+    sort -gu |
+    tr '\n' ' ')
+  times=${times% }
+  printf 'Compile cache: AOT reused=%s | torch.compile took %s s\n' \
+    "$aot" "${times:-n/a}"
+}
+
+startup_diagnostic_hints() {
+  local log_file=$1
+  local flat stale
+
+  [[ -s "$log_file" ]] || return 0
+  flat=$(tr -d '\r\n' <"$log_file")
+
+  case "$flat" in
+    *"No available shared memory broadcast block found"*)
+      stale=$(find /dev/shm -maxdepth 1 -name 'psm_*' 2>/dev/null | wc -l)
+      echo
+      echo "Hint: the engine log reports a shared-memory broadcast stall."
+      echo "  A reader did not drain the broadcast queue in time, which usually means a"
+      echo "  worker was stuck or doing very slow first-run work."
+      echo "  /dev/shm currently holds ${stale} torch shared-memory segment(s) (psm_*),"
+      echo "  which forced kills leave behind. Report the stall with the stale count to"
+      echo "  the maintainer before deleting them: other torch programs may own them."
+      ;;
+  esac
+  return 0
 }
 
 stop_pid_file() {
@@ -5646,13 +5756,123 @@ maybe_run_startup_performance_test() {
   run_startup_performance_test "$url_host" || true
 }
 
+# Route-level capability gate for the default FRONTEND=auto selection. The
+# Rust frontend is only exercised for the serving shapes that this repository
+# has validated; everything else keeps the Python frontend. Use
+# `--frontend rust` to force it for an unvalidated route.
+#
+# Validated on the Rust frontend: text-only and text+image routes, with no
+# speculative decoding or with MTP/DFlash, including the per-request
+# spec-decode metrics block that DFlash enables by default.
+rust_frontend_route_gate() {
+  RUST_FRONTEND_SKIP_REASON=""
+
+  local spec_method
+  spec_method=$(effective_speculative_method 2>/dev/null || true)
+  spec_method=$(normalize_speculative_method_value "$spec_method")
+
+  if [[ -n "${MESSAGE_TYPE:-}" && "${MESSAGE_TYPE}" != "text-only" && "${MESSAGE_TYPE}" != "text+image" ]]; then
+    RUST_FRONTEND_SKIP_REASON="MESSAGE_TYPE=${MESSAGE_TYPE} (only text-only and text+image are validated)"
+  elif [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" || -n "${TOOL_CALL_PARSER:-}" ]]; then
+    RUST_FRONTEND_SKIP_REASON="tool calling is unvalidated"
+  elif [[ -n "$spec_method" && "$spec_method" != "none" && "$spec_method" != "mtp" && "$spec_method" != "dflash" ]]; then
+    RUST_FRONTEND_SKIP_REASON="speculative method '$spec_method' is unvalidated (mtp and dflash are)"
+  elif [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+    RUST_FRONTEND_SKIP_REASON="SSD prefix cache is unvalidated"
+  elif [[ "${VLLM_ENABLE_SCALE_OUT_ENDPOINTS:-0}" == "1" ]]; then
+    RUST_FRONTEND_SKIP_REASON="scale-out endpoints are Python-only"
+  fi
+
+  [[ -z "$RUST_FRONTEND_SKIP_REASON" ]]
+}
+
+resolve_rust_frontend_binary() {
+  local candidate
+
+  if [[ -n "${VLLM_RUST_FRONTEND_PATH:-}" ]]; then
+    if [[ -x "$VLLM_RUST_FRONTEND_PATH" ]]; then
+      printf '%s\n' "$VLLM_RUST_FRONTEND_PATH"
+      return 0
+    fi
+    echo "ERROR: VLLM_RUST_FRONTEND_PATH is not executable: $VLLM_RUST_FRONTEND_PATH" >&2
+    return 1
+  fi
+
+  for candidate in "$RUNTIME_ROOT/vllm/vllm-rs" "$MANAGER_ROOT/vllm/vllm-rs"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "ERROR: the Rust frontend binary (vllm-rs) was not found." >&2
+  echo "  Build it with ./build_rust.sh, or set VLLM_RUST_FRONTEND_PATH." >&2
+  return 1
+}
+
+# Split the resolved engine arguments into the ones the Rust frontend owns and
+# the ones the managed Python headless engine owns. The frontend parses serving
+# arguments itself and only forwards a subset to the engine, so forwarding them
+# twice would either be ignored or rejected.
+split_rust_frontend_args() {
+  local host_arg=$1
+  local arg next
+  local i=0
+
+  RUST_FRONTEND_ARGS=(--host "$host_arg" --port "$PORT" --python "$RUNTIME_ROOT/.venv/bin/python3")
+  RUST_ENGINE_ARGS=()
+
+  while (( i < ${#VLLM_ARGS[@]} )); do
+    arg=${VLLM_ARGS[i]}
+    case "$arg" in
+      # Handled by the frontend transport itself.
+      --host | --port | --model)
+        ((i += 2))
+        continue
+        ;;
+      # Frontend-owned serving arguments (the frontend forwards the ones the
+      # engine also needs).
+      --served-model-name | --reasoning-parser | --tool-call-parser | \
+        --tool-parser-plugin | --limit-mm-per-prompt | --chat-template | \
+        --default-chat-template-kwargs)
+        next=${VLLM_ARGS[i + 1]:-}
+        RUST_FRONTEND_ARGS+=("$arg" "$next")
+        ((i += 2))
+        continue
+        ;;
+      --language-model-only | --enable-prompt-tokens-details | --disable-log-stats)
+        RUST_FRONTEND_ARGS+=("$arg")
+        ((i += 1))
+        continue
+        ;;
+    esac
+
+    RUST_ENGINE_ARGS+=("$arg")
+    case "$arg" in
+      # Engine flags that take no value.
+      --enable-chunked-prefill | --enable-prefix-caching | --no-enable-prefix-caching | \
+        --enforce-eager | --no-async-scheduling | --disable-hybrid-kv-cache-manager | \
+        --skip-mm-profiling | --disable-custom-all-reduce | --prefill-batch-barrier)
+        ((i += 1))
+        ;;
+      *)
+        if (( i + 1 < ${#VLLM_ARGS[@]} )); then
+          RUST_ENGINE_ARGS+=("${VLLM_ARGS[i + 1]}")
+          ((i += 2))
+        else
+          ((i += 1))
+        fi
+        ;;
+    esac
+  done
+}
+
 launch_server() {
   mkdir -p "$LOG_DIR"
   local safe_name log_file pid_file host_arg url_host args_text launch_token
   local -a server_env=(env)
-  if [[ -z "${SERVED_NAME:-}" ]]; then
-    SERVED_NAME=$(basename "$MODEL_DIR")
-  fi
+  local -a launch_cmd=()
+  [[ -z "${SERVED_NAME:-}" ]] && SERVED_NAME=$(basename "$MODEL_DIR")
   GPU_DEVICES=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   TP_SIZE=${TP_SIZE:-$(gpu_device_count "$GPU_DEVICES")}
   if [[ -z "${SERVED_NAME:-}" || "$SERVED_NAME" == "." || "$SERVED_NAME" == "/" ]]; then
@@ -5673,13 +5893,36 @@ launch_server() {
   fi
 
   build_args "$host_arg"
-  printf -v args_text '%q ' "${VLLM_ARGS[@]}"
+
+  FRONTEND=$(normalize_frontend_kind "${FRONTEND:-auto}") || return 1
+  local frontend_note=""
+  if [[ "$FRONTEND" == "auto" ]]; then
+    if ! rust_frontend_route_gate; then
+      frontend_note="; $RUST_FRONTEND_SKIP_REASON"
+      FRONTEND=python
+    elif ! resolve_rust_frontend_binary >/dev/null 2>&1; then
+      frontend_note="; vllm-rs binary not built"
+      FRONTEND=python
+    else
+      FRONTEND=rust
+    fi
+  fi
+  if [[ "$FRONTEND" == "rust" ]]; then
+    local rust_frontend_binary
+    rust_frontend_binary=$(resolve_rust_frontend_binary) || return 1
+    split_rust_frontend_args "$host_arg"
+    launch_cmd=("$rust_frontend_binary" serve "$MODEL_DIR" "${RUST_FRONTEND_ARGS[@]}" -- "${RUST_ENGINE_ARGS[@]}")
+  else
+    launch_cmd=("$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}")
+  fi
+  printf -v args_text '%q ' "${launch_cmd[@]}"
 
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     echo
     echo "DRY RUN"
     echo "Environment:"
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+    echo "  Frontend: $FRONTEND${frontend_note}"
     echo "  DFlash draft fetch=$(current_dflash_download_route_label)"
     echo "  VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}"
     echo "  VLLM_DISABLE_TILELANG=${VLLM_DISABLE_TILELANG:-0}"
@@ -5687,9 +5930,13 @@ launch_server() {
     echo "  VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}"
     echo "  VLLM_DEFAULT_THINKING_TOKEN_BUDGET=${VLLM_DEFAULT_THINKING_TOKEN_BUDGET:-}"
     echo "Command:"
-    echo "  $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
+    echo "  $args_text"
     return 0
   fi
+
+  # A second server would reuse the running one's /health response and be
+  # reported as a successful start, so refuse before spawning.
+  refuse_duplicate_start "$url_host" "$PORT" || return 1
 
   if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
     mkdir -p -- "$KV_DISK_CACHE_DIR" || return 1
@@ -5726,7 +5973,8 @@ launch_server() {
     echo "DFlash draft fetch: $(current_dflash_download_route_label)"
     echo "TQ diagnostics: $(current_tq_diagnostics_label)"
     echo "Strict tool calling: VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}"
-    echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
+    echo "Frontend: $FRONTEND${frontend_note}"
+    echo "Command: $args_text"
     echo "============================================================"
   } > "$log_file"
 
@@ -5741,14 +5989,15 @@ launch_server() {
   echo "  Strict tool calling: VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-0}"
   echo "  Served name: $SERVED_NAME"
   echo "  Model: $MODEL_DIR"
+  echo "  Frontend: $FRONTEND${frontend_note}"
   echo "  Bind: $host_arg:$PORT"
 
   launch_token="launch-$$-$STAMP-$RANDOM$RANDOM"
   server_env+=("VLLM_LAUNCH_TOKEN=$launch_token")
   if command -v setsid >/dev/null 2>&1; then
-    nohup setsid "${server_env[@]}" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$log_file" 2>&1 &
+    nohup setsid "${server_env[@]}" "${launch_cmd[@]}" >>"$log_file" 2>&1 &
   else
-    nohup "${server_env[@]}" "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$log_file" 2>&1 &
+    nohup "${server_env[@]}" "${launch_cmd[@]}" >>"$log_file" 2>&1 &
   fi
   CURRENT_SERVER_PID=$!
   echo "$CURRENT_SERVER_PID" > "$pid_file"
@@ -5793,6 +6042,7 @@ launch_server() {
     echo
     echo "START FAILED"
     echo "Log: $log_file"
+    startup_diagnostic_hints "$log_file"
     tail -n 120 "$log_file" || true
     echo "Cleaning up failed server processes..."
     cleanup_failed_launch "$pid_file"
@@ -5806,6 +6056,25 @@ launch_server() {
     cleanup_failed_launch "$pid_file"
     restore_overcommit_memory || true
     return 1
+  fi
+  if [[ "${PREWARM_COMPILE_ONLY:-0}" == "1" ]]; then
+    # Warm mode: the graph is captured and the compile cache is written by the
+    # time /health answers, so stop the server and leave the artifacts behind
+    # for the next real start on this route.
+    echo
+    echo "Prewarm mode: stopping the server; compiled artifacts stay cached."
+    if ! stop_pid_file "$pid_file"; then
+      echo "ERROR: prewarm server did not stop cleanly; kept $pid_file for cleanup." >&2
+      restore_overcommit_memory || true
+      return 1
+    fi
+    restore_overcommit_memory || true
+    clear_last_service_state
+    echo "PREWARM OK"
+    compile_cache_report_from_log "$log_file" || true
+    echo "Log: $log_file"
+    echo "The next start on this route reuses the compiled graph."
+    return 0
   fi
   if [[ "${SKIP_STARTUP_SMOKE:-0}" == "1" ]]; then
     restore_overcommit_memory || true
