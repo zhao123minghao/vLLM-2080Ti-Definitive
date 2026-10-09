@@ -4,6 +4,23 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ## Unreleased
 
+### Fork identity and provenance in the README
+
+The README still described the original repository: `Branch`, `Release reference` and the clone
+command all pointed at `weicj/vLLM-2080Ti-Definitive`, and the Credits section credited upstream
+vLLM without naming the fork this repository is built on.
+
+- The clone command and `Branch` now point at this fork, and the Credits section states the whole
+  chain (this fork → `weicj/vLLM-2080Ti-Definitive` → upstream vLLM, all Apache-2.0), so the
+  attribution the project requires is explicit rather than implied. `Release reference`
+  deliberately still points at the original repository: that is where the `v0.2.2-post3` release
+  lives, and this fork has no tags or Releases of its own, so repointing it would be a dead link.
+- `update.sh` follows the original repository's releases by default (`REMOTE_REPO`,
+  `REMOTE_RELEASE_API`), which would replace this fork's additions with upstream code. The README
+  now says so and shows the override instead of recommending the bare `./update.sh`.
+- New "What This Fork Adds" / "本 fork 新增了什么" section lists what this fork adds on top of
+  `v0.2.2-post3`, mirroring the Unreleased entries below.
+
 ### Scheduler shadow skeleton
 
 The scheduler is step 3 of the `v1/core` spike and the only piece whose correctness cannot be

@@ -20,9 +20,29 @@ profile 和验证资料。它基于上游 vLLM；再发布派生版本时必须�
 当前 0.2.x 基线：`v0.2.2-post3`
 上游基线：`b23433088b`（`v0.29.1rc0-33`）
 
-分支：[`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
-版本参考：[v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
+分支：[`main`](https://github.com/zhao123minghao/vLLM-2080Ti-Definitive/tree/main)（本 fork）
+原始仓库：[weicj/vLLM-2080Ti-Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive)
+版本参考：[v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)（本 fork 所基于的上游 release）
 版本记录：[CHANGELOG.md](CHANGELOG.md)
+
+## 🧩 本 fork 新增了什么
+
+本 fork 保持着同一套 SM75 runtime，并在 `v0.2.2-post3` 之上增加了：
+
+- **`v1/core` Rust 验证** —— 逐字节前缀哈希一致性，以及 KV 缓存块记账的影子校验移植：空闲队列、
+  哈希映射、块大小感知哈希视图、KV 事件队列、指标收集器，以及依赖 `Request` 的缓存入口。
+- **调度器影子骨架** —— 真实调度器在带种子工作负载上的决策轨迹，以及每条被记录决策必须满足的
+  十类不变式。
+- **一键校验**（`tools/validate_all.sh`）—— 静态检查、两项跨语言一致性扫描、实机对话回归、
+  依赖审计与调度器影子。
+- **启动插桩** —— executor 与引擎输出的 `startup:` 标记，以及用 `tools/startup_timeline.py`
+  把它们读回成逐阶段时间线。
+- **服务链路细化** —— 惰性导入（不让 serving 依赖进入 headless 引擎路径）、经 Rust 前端协议
+  透传的逐请求投机解码指标，以及 launcher 对重复启动与 `FRONTEND` 误配的防护。
+
+细节与依据：[CHANGELOG.md](CHANGELOG.md)、
+[v1/core Rust 迁移](docs/v1-core-rust-migration.zh-CN.md)、
+[调度器影子](docs/scheduler-shadow.zh-CN.md)、[启动时间线](docs/startup-timeline.zh-CN.md)。
 
 ## 💡 为什么用 RTX 2080 Ti 做 LLM 推理？
 
@@ -79,15 +99,23 @@ Launcher 支持 TP、PP 及 TP/PP 混合推理；已验证布局包括双 RTX 20
 1. 首次构建：
 
 ```bash
-git clone https://github.com/weicj/vLLM-2080Ti-Definitive.git
+git clone https://github.com/zhao123minghao/vLLM-2080Ti-Definitive.git
 cd vLLM-2080Ti-Definitive
 ./build.sh
 ```
 
+如果你只想要上游 runtime、不要本 fork 的新增，请改 clone
+[原始仓库](https://github.com/weicj/vLLM-2080Ti-Definitive)；两者共享历史，改动 remote
+就可以在两者之间切换。
+
 2. 将已有仓库更新到最新 GitHub Release：
 
+`update.sh` 默认跟随**原始仓库**的 release（`REMOTE_REPO` 与 `REMOTE_RELEASE_API`），
+会把本 fork 的新增替换回上游代码。请把这两个变量指向本 fork 的 release，或直接用
+`git pull` 更新：
+
 ```bash
-./update.sh
+REMOTE_REPO=<本 fork 仓库地址> REMOTE_RELEASE_API=<本 fork release API> ./update.sh
 ```
 
 更新脚本会保留本地虚拟环境、依赖缓存、日志、结果以及 `profiles/local`，比较本地
@@ -219,9 +247,10 @@ CUDA Graph/AOT 编译时降频很容易被误判为软件性能回退。
 
 ## 🙏 致谢 / 上游项目
 
-本仓库是基于上游 [vLLM](https://github.com/vllm-project/vllm) 的硬件定向 fork，
-遵循 Apache-2.0 license，保留上游项目结构，并加入面向双 2080 Ti 的 SM75 runtime
-补丁和启动 profile。
+本仓库是基于 [vLLM 2080 Ti Definitive
+Edition](https://github.com/weicj/vLLM-2080Ti-Definitive) 的硬件定向 fork，而后者又是基于上游
+[vLLM](https://github.com/vllm-project/vllm) 的硬件定向 fork；两者均遵循 Apache-2.0 license。
+本仓库保留上游项目结构，并加入面向双 2080 Ti 的 SM75 runtime 补丁和启动 profile。
 
 当前使用或集成的加速组件包括：
 

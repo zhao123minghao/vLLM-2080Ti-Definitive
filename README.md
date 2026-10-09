@@ -22,9 +22,31 @@ For usage feedback, feature requests, and community discussion, join the
 Current 0.2.x baseline: `v0.2.2-post3`
 Upstream baseline: `b23433088b` (`v0.29.1rc0-33`)
 
-Branch: [`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
-Release reference: [v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
+Branch: [`main`](https://github.com/zhao123minghao/vLLM-2080Ti-Definitive/tree/main) (this fork)
+Original repository: [weicj/vLLM-2080Ti-Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive)
+Release reference: [v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3) (the upstream release this fork is based on)
 Release history: [CHANGELOG.md](CHANGELOG.md)
+
+## 🧩 What This Fork Adds
+
+This fork carries the same SM75 runtime and adds the work below on top of `v0.2.2-post3`:
+
+- **`v1/core` Rust spike** — byte-exact prefix-hash parity, plus shadow-verified ports of the
+  KV-cache block bookkeeping: free queue, hash map, block-size-aware hash view, KV-cache event
+  queue, metrics collector and the `Request`-based cache entry points.
+- **Scheduler shadow skeleton** — a recorded decision trace of the real scheduler on a seeded
+  workload, and the ten invariant families every recorded decision has to satisfy.
+- **One-command validation** (`tools/validate_all.sh`) — static checks, both cross-language
+  parity sweeps, a live chat regression, the dependency audit and the scheduler shadow.
+- **Startup instrumentation** — `startup:` markers from the executor and the engine, plus
+  `tools/startup_timeline.py` to read them back into a phase-by-phase timeline.
+- **Serving-path refinements** — lazy imports that keep the serving stack out of the headless
+  engine path, per-request spec-decode metrics carried through the Rust frontend protocol, and
+  launcher guards for duplicate starts and a misconfigured `FRONTEND`.
+
+Details and evidence: [CHANGELOG.md](CHANGELOG.md),
+[v1/core Rust migration](docs/v1-core-rust-migration.md),
+[scheduler shadow](docs/scheduler-shadow.md), [startup timeline](docs/startup-timeline.md).
 
 ## 💡 Why RTX 2080 Ti For LLM Inference?
 
@@ -86,15 +108,23 @@ Both rows are single-request tests using DFlash2 (default K=7) and synthetic tex
 1. Build a new checkout:
 
 ```bash
-git clone https://github.com/weicj/vLLM-2080Ti-Definitive.git
+git clone https://github.com/zhao123minghao/vLLM-2080Ti-Definitive.git
 cd vLLM-2080Ti-Definitive
 ./build.sh
 ```
 
+Clone the [original repository](https://github.com/weicj/vLLM-2080Ti-Definitive) instead if you
+want the upstream runtime without this fork's additions; the two share history, so a checkout can
+switch between them with a normal remote change.
+
 2. Update an existing checkout to the latest GitHub Release:
 
+`update.sh` follows the **original** repository's releases by default (`REMOTE_REPO` and
+`REMOTE_RELEASE_API`), which would replace this fork's additions with upstream code. Point both
+at a release of this fork, or update this checkout with `git pull` instead:
+
 ```bash
-./update.sh
+REMOTE_REPO=<fork-repo-url> REMOTE_RELEASE_API=<fork-release-api> ./update.sh
 ```
 
 The update helper preserves local environments, dependency caches, logs,
@@ -245,8 +275,9 @@ particularly during long prefill and repeated CUDA Graph/AOT compilation.
 ## 🙏 Credits And Upstream Projects
 
 This repository is a hardware-focused fork of
-[vLLM](https://github.com/vllm-project/vllm), licensed under Apache-2.0. It
-keeps the upstream project structure and adds local SM75 runtime patches,
+[vLLM 2080 Ti Definitive Edition](https://github.com/weicj/vLLM-2080Ti-Definitive), which is
+itself a hardware-focused fork of [vLLM](https://github.com/vllm-project/vllm); both are licensed
+under Apache-2.0. It keeps the upstream project structure and adds local SM75 runtime patches,
 launch profiles, and dual-2080-Ti validation notes.
 
 Acceleration components used or integrated by this runtime include:
