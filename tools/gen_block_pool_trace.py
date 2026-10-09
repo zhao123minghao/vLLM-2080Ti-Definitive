@@ -53,9 +53,11 @@ os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
 
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool  # noqa: E402
 from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+    BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
     FreeKVCacheBlockQueue,
+    resolve_block_hashes,
 )
 
 # Keys are arbitrary bytes: BlockHashWithGroupId is a NewType over bytes, and the map only
@@ -87,6 +89,7 @@ class Recorder:
         self.pool: PoolDriver | None = (
             PoolDriver(self, pool_blocks, pool_caching, key_space, rng) if pool_blocks else None
         )
+        self.hashlist = HashListDriver(self, rng)
 
     # ------------------------------------------------------------------ helpers
 
@@ -230,6 +233,8 @@ class Recorder:
         self.op_init()
         if self.pool is not None:
             self.pool.op_init()
+        # Explicit setup so the trace never depends on either side's defaults.
+        self.hashlist.op_raw()
         for _ in range(num_ops):
             self.step()
         # A fixed tail so the final state of both implementations is always compared.
@@ -242,11 +247,18 @@ class Recorder:
             self.pool.op_num_free()
             self.pool.op_usage()
             self.pool.op_dump()
+        self.hashlist.op_len()
+        self.hashlist.op_iter()
 
     def step(self) -> None:
-        # The pool gets its own share of the steps and is driven from its own state.
-        if self.pool is not None and self.rng.random() < 0.6:
+        # The pool and the hash-list view get their own share of the steps and are driven
+        # from their own state.
+        draw = self.rng.random()
+        if self.pool is not None and draw < 0.5:
             self.pool.step()
+            return
+        if draw < 0.7:
+            self.hashlist.step()
             return
         choice = self.rng.choices(
             [
@@ -573,6 +585,146 @@ class PoolDriver:
             self.op_usage()
         else:
             self.op_dump()
+
+
+class HashListDriver:
+    """Drives `BlockHashListWithBlockSize` and `resolve_block_hashes`.
+
+    These are the two ways the scheduler reads a prefix's hashes at the granularity a KV cache
+    group needs. Unlike the pool, the interesting parts here are the index arithmetic
+    (`(idx + 1) * scale_factor - 1`), Python's slice normalisation, negative indices, and the
+    branches of `resolve_block_hashes` (same size, existing view, fine-grained partial hits,
+    and the size assertion).
+
+    `current` is whatever the last operation produced — a raw hash list or a view — which is
+    also how the call site sees it, so both representations stay in play.
+    """
+
+    def __init__(self, recorder: Recorder, rng: random.Random) -> None:
+        self.rec = recorder
+        self.rng = rng
+        self.hash_block_size = 16
+        self.raw: list[bytes] = []
+        self.current: list[bytes] | BlockHashListWithBlockSize = []
+
+    def _record(self, operation: str, tokens: list[str]) -> None:
+        self.rec._record(operation, tokens)
+
+    def _hashes(self, count: int) -> list[bytes]:
+        return [bytes([0xC0 + self.rng.randrange(16), self.rng.randrange(256)]) for _ in range(count)]
+
+    def _hexes(self, values) -> list[str]:
+        return [bytes(value).hex() for value in values]
+
+    # --------------------------------------------------------------------- ops
+
+    def op_raw(self) -> None:
+        size = self.rng.choice([8, 16, 32])
+        hashes = self._hashes(self.rng.randint(1, 8))
+        self.hash_block_size = size
+        self.raw = hashes
+        self.current = hashes
+        self._record(
+            "bhlist_raw " + " ".join([str(size), *(hash_.hex() for hash_ in hashes)]), ["ok"]
+        )
+
+    def op_init(self) -> None:
+        size = self.rng.choice([8, 16, 32])
+        scale = self.rng.choice([1, 2, 3, 4])
+        # Sometimes ask for a target size that is not a multiple, to hit the assert.
+        target = size * scale + (1 if self.rng.random() < 0.15 else 0)
+        hashes = self._hashes(self.rng.randint(1, 6) * scale)
+        operation = "bhlist_init " + " ".join(
+            [str(size), str(target), *(hash_.hex() for hash_ in hashes)]
+        )
+        try:
+            view = BlockHashListWithBlockSize(hashes, size, target)
+        except Exception as exc:  # noqa: BLE001
+            self.rec._record_error(operation, exc)
+            return
+        self.hash_block_size = size
+        self.raw = hashes
+        self.current = view
+        self._record(operation, ["ok"])
+
+    def op_len(self) -> None:
+        self._record("bhlist_len", ["ok", str(len(self.current))])
+
+    def op_get(self) -> None:
+        length = len(self.current)
+        index = self.rng.choice(
+            [0, -1, length - 1, length, length + 3, -length - 2, self.rng.randint(-6, 6)]
+        )
+        operation = f"bhlist_get {index}"
+        try:
+            value = self.current[index]
+        except Exception as exc:  # noqa: BLE001
+            self.rec._record_error(operation, exc)
+            return
+        self._record(operation, ["ok", bytes(value).hex()])
+
+    def op_slice(self) -> None:
+        parts = []
+        for _ in range(3):
+            if self.rng.random() < 0.4:
+                parts.append("-")
+            else:
+                parts.append(str(self.rng.choice([0, 1, 2, -1, -2, 5, -5, 0])))
+        start = None if parts[0] == "-" else int(parts[0])
+        stop = None if parts[1] == "-" else int(parts[1])
+        step = None if parts[2] == "-" else int(parts[2])
+        operation = "bhlist_slice " + " ".join(parts)
+        try:
+            sliced = self.current[slice(start, stop, step)]
+        except Exception as exc:  # noqa: BLE001
+            self.rec._record_error(operation, exc)
+            return
+        self._record(operation, ["ok", *self._hexes(sliced)])
+
+    def op_iter(self) -> None:
+        self._record("bhlist_iter", ["ok", *self._hexes(list(self.current))])
+
+    def op_resolve(self) -> None:
+        factor = self.rng.choice([1, 1, 2, 3, 4])
+        block_size = self.hash_block_size * factor + (1 if self.rng.random() < 0.15 else 0)
+        fine = self.rng.random() < 0.5
+        alignment = self.rng.choice(
+            [None, self.hash_block_size, self.hash_block_size * 2, 1, block_size]
+        )
+        operation = (
+            f"bhlist_resolve {block_size} {int(fine)} "
+            f"{'-' if alignment is None else alignment}"
+        )
+        try:
+            resolved = resolve_block_hashes(
+                self.current,
+                self.hash_block_size,
+                block_size,
+                supports_fine_grained_hash_lookup=fine,
+                alignment_tokens=alignment,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.rec._record_error(operation, exc)
+            return
+        self.current = resolved
+        self._record(operation, ["ok", *self._hexes(list(resolved))])
+
+    # ---------------------------------------------------------------- schedule
+
+    def step(self) -> None:
+        choice = self.rng.choices(
+            ["raw", "init", "len", "get", "slice", "iter", "resolve"],
+            weights=[2, 4, 3, 8, 8, 3, 10],
+        )[0]
+        {
+            "raw": self.op_raw,
+            "init": self.op_init,
+            "len": self.op_len,
+            "get": self.op_get,
+            "slice": self.op_slice,
+            "iter": self.op_iter,
+            "resolve": self.op_resolve,
+        }[choice]()
 
 
 def main() -> int:

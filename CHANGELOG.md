@@ -12,21 +12,22 @@ recorded operation trace:
 
 - New `rust/src/kv-pool` (`vllm-kv-pool`): `FreeKVCacheBlockQueue` as an index-addressed
   doubly linked list with the same fake head/tail sentinels, `BlockHashToBlockMap` with
-  the same single-or-group semantics, and `BlockPool` on top of both — reference counts, the
+  the same single-or-group semantics, `BlockPool` on top of both — reference counts, the
   two reuse orders of `free_blocks` (uncached blocks LIFO, cached blocks LRU), `touch`,
   `unpin` with its reuse watchers, eviction on allocation, the per-block hash metadata and
-  the reset path. The failure modes are part of the contract — `ValueError` for `popleft()`
-  on an empty queue or `get_new_blocks()` beyond the free count, `AssertionError` for
-  `popleft_n()` beyond the free count, `RuntimeError` for `remove()` of a block that is not
-  in the list — and the free-block counter is signed because Python's `int` can drift
-  negative.
+  the reset path — and `BlockHashListWithBlockSize` plus `resolve_block_hashes`, the
+  block-size-aware view the scheduler reads hashes through (index arithmetic, Python slice
+  normalisation, negative indices, and the fine-grained-partial-hit branch). The failure
+  modes are part of the contract: `ValueError`, `AssertionError`, `RuntimeError` and
+  `IndexError` are reproduced as the exception Python would have raised, and the free-block
+  counter is signed because Python's `int` can drift negative.
 - New `tools/check_block_pool_parity.sh` plus `tools/gen_block_pool_trace.py`: the recorder
   drives the **real** Python classes with a seeded random operation sequence and writes the
   trace together with the log Python produced, including the exception class of every
   rejected operation; the Rust binary replays the trace and the two logs are diffed.
-  Verified with 8 traces: **6,505 operations compared, 3,957 of them pool operations, 491
-  rejections, every line identical**, plus 18 crate unit tests for what a log diff cannot
-  see.
+  Verified with 6 traces of ~1,217 operations: **7,300 operations compared, 3,640 of them pool
+  operations and 1,428 hash-list operations, 810 rejections, every line identical**, plus 23
+  crate unit tests for what a log diff cannot see.
 
 ### One-command validation
 

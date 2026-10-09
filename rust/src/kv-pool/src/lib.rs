@@ -29,8 +29,10 @@
 
 use std::fmt::Write as _;
 
+pub mod hashes;
 pub mod pool;
 
+pub use hashes::{BlockHashListView, HashList, format_hashes, resolve_block_hashes};
 pub use pool::BlockPool;
 
 /// The Python exception a rejected operation corresponds to.
@@ -39,12 +41,16 @@ pub use pool::BlockPool;
 /// produced by [`replay`] must match `type(exc).__name__` on the Python side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyError {
-    /// `ValueError`, for example popping from an empty free queue.
+    /// `ValueError`, for example popping from an empty free queue or a slice step of zero.
     Value,
     /// `AssertionError`, for example popping more blocks than the queue holds.
     Assert,
     /// `RuntimeError`, for example removing a block that is not in the list.
     Runtime,
+    /// `IndexError`, for example reading a block hash past the end of a list.
+    Index,
+    /// `ZeroDivisionError`, for example a block size of zero.
+    Zero,
 }
 
 impl PyError {
@@ -54,6 +60,8 @@ impl PyError {
             PyError::Value => "ValueError",
             PyError::Assert => "AssertionError",
             PyError::Runtime => "RuntimeError",
+            PyError::Index => "IndexError",
+            PyError::Zero => "ZeroDivisionError",
         }
     }
 }
@@ -389,6 +397,10 @@ pub fn replay(trace: &str) -> Result<String, String> {
     let mut queue: Option<FreeQueue> = None;
     let mut map = BlockHashToBlockMap::new();
     let mut pool: Option<BlockPool> = None;
+    let mut hashes = HashList::Raw(Vec::new());
+    // The harness starts with an empty raw list at a block size of 16, the same defaults the
+    // Python driver uses, so a trace can begin with any hash-list operation.
+    let mut hash_block_size: usize = 16;
 
     for (index, raw) in trace.lines().enumerate() {
         let line = raw.trim();
@@ -396,8 +408,15 @@ pub fn replay(trace: &str) -> Result<String, String> {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        let tokens = apply(&parts, &mut queue, &mut map, &mut pool)
-            .map_err(|message| format!("line {}: {message}", index + 1))?;
+        let tokens = apply(
+            &parts,
+            &mut queue,
+            &mut map,
+            &mut pool,
+            &mut hashes,
+            &mut hash_block_size,
+        )
+        .map_err(|message| format!("line {}: {message}", index + 1))?;
         writeln!(out, "{line} -> {}", tokens.join(" ")).expect("writing to a String");
     }
     Ok(out)
@@ -408,6 +427,8 @@ fn apply(
     queue: &mut Option<FreeQueue>,
     map: &mut BlockHashToBlockMap,
     pool: &mut Option<BlockPool>,
+    hashes: &mut HashList,
+    hash_block_size: &mut usize,
 ) -> Result<Vec<String>, String> {
     let op = parts[0];
     let ids = |from: usize| -> Result<Vec<usize>, String> {
@@ -632,6 +653,73 @@ fn apply(
             Some(pool) => Ok(ok_value(pool.dump())),
             None => Err("pool_dump before pool_init".to_string()),
         },
+        "bhlist_raw" => {
+            let size = parse_usize(need(parts, 1, "bhlist_raw <hash_block_size> <hash>...")?)?;
+            let raw = decode_hashes(&parts[2..])?;
+            *hash_block_size = size;
+            *hashes = HashList::Raw(raw);
+            Ok(ok())
+        }
+        "bhlist_init" => {
+            let usage = "bhlist_init <hash_block_size> <target_block_size> <hash>...";
+            let size = parse_usize(need(parts, 1, usage)?)?;
+            let target = parse_usize(need(parts, 2, usage)?)?;
+            let raw = decode_hashes(&parts[3..])?;
+            // Python assigns the view only when the constructor returns, so a rejected
+            // construction leaves the previous state in place.
+            match BlockHashListView::new(raw, size, target) {
+                Ok(view) => {
+                    *hash_block_size = size;
+                    *hashes = HashList::View(view);
+                    Ok(ok())
+                }
+                Err(error) => Ok(err(error)),
+            }
+        }
+        "bhlist_len" => Ok(ok_value(hashes.len().to_string())),
+        "bhlist_get" => {
+            let index = parse_i64(need(parts, 1, "bhlist_get <index>")?)?;
+            Ok(match hashes.get(index) {
+                Ok(hash) => ok_value(hex_encode(&hash)),
+                Err(error) => err(error),
+            })
+        }
+        "bhlist_slice" => {
+            let usage = "bhlist_slice <start|-> <stop|-> <step|->";
+            let start = parse_optional_i64(need(parts, 1, usage)?)?;
+            let stop = parse_optional_i64(need(parts, 2, usage)?)?;
+            let step = parse_optional_i64(need(parts, 3, usage)?)?;
+            Ok(match hashes.slice(start, stop, step) {
+                Ok(sliced) => ok_values(sliced.iter().map(|hash| hex_encode(hash))),
+                Err(error) => err(error),
+            })
+        }
+        "bhlist_iter" => Ok(ok_values(
+            hashes.values().iter().map(|hash| hex_encode(hash)),
+        )),
+        "bhlist_resolve" => {
+            let usage = "bhlist_resolve <block_size> <0|1 fine_grained> <alignment|->";
+            let block_size = parse_usize(need(parts, 1, usage)?)?;
+            let fine_grained = parse_bool(need(parts, 2, usage)?)?;
+            let alignment = parse_optional_usize(need(parts, 3, usage)?)?;
+            Ok(
+                match resolve_block_hashes(
+                    hashes,
+                    *hash_block_size,
+                    block_size,
+                    fine_grained,
+                    alignment,
+                ) {
+                    Ok(resolved) => {
+                        let tokens =
+                            ok_values(resolved.values().iter().map(|hash| hex_encode(hash)));
+                        *hashes = resolved;
+                        tokens
+                    }
+                    Err(error) => err(error),
+                },
+            )
+        }
         other => Err(format!("unknown operation `{other}`")),
     }
 }
@@ -665,6 +753,26 @@ fn parse_bool(token: &str) -> Result<bool, String> {
         "1" | "true" => Ok(true),
         _ => Err(format!("expected 0 or 1, got `{token}`")),
     }
+}
+
+fn parse_optional_i64(token: &str) -> Result<Option<i64>, String> {
+    if token == "-" {
+        Ok(None)
+    } else {
+        parse_i64(token).map(Some)
+    }
+}
+
+fn parse_optional_usize(token: &str) -> Result<Option<usize>, String> {
+    if token == "-" {
+        Ok(None)
+    } else {
+        parse_usize(token).map(Some)
+    }
+}
+
+fn decode_hashes(tokens: &[&str]) -> Result<Vec<Vec<u8>>, String> {
+    tokens.iter().map(|token| hex_decode(token)).collect()
 }
 
 fn ok() -> Vec<String> {

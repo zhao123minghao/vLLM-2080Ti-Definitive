@@ -93,13 +93,22 @@ layers of that state which the scheduler mutates on every step:
   `unpin`/reuse-watcher path, cache eviction on allocation, per-block hash metadata plus the
   extra-hash set of `cached_block_hashes_by_block`, and the reset path that only succeeds when
   every block but the reserved null block is free.
+* `BlockHashListWithBlockSize` and `resolve_block_hashes` — the granularity view the scheduler
+  reads hashes through. `hash_block_size` and a group's `block_size` can differ, and because
+  every hash chains over its whole prefix, the last `hash_block_size` hash inside a target block
+  already fingerprints it: the conversion is a lazy index view, `(idx + 1) * scale_factor - 1`.
+  The port reproduces that arithmetic, Python's negative indices and `IndexError`, Python slice
+  normalisation (including negative steps and the zero-step `ValueError`), and every branch of
+  `resolve_block_hashes` (same size, an existing view, fine-grained partial hits keeping the raw
+  hashes, and the divisibility assertion). This matters here rather than in theory: the
+  deployment runs a hybrid model whose KV cache groups do not all use `hash_block_size`.
 
 `tools/check_block_pool_parity.sh` is the hashing method turned into a generator:
 
 ```bash
 bash tools/check_block_pool_parity.sh
-bash tools/check_block_pool_parity.sh --seeds 8 --num-ops 800 --pool-blocks 24
-# -> block_pool_parity_ok traces=8 operations=6505
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
+# -> block_pool_parity_ok traces=6 operations=7300
 ```
 
 `tools/gen_block_pool_trace.py` drives the **real** Python classes with a seeded random
@@ -109,15 +118,16 @@ binary replays the trace and the two logs are diffed. Sweeping seeds is what mak
 shadow check rather than a unit test: the interesting part is that the *rejections* line up as
 well, which is where a rewrite usually drifts.
 
-Verified with 8 traces of ~813 operations (**6,505 operations compared, 3,957 of them pool
-operations, 491 rejected by Python**): every log line matches, including which exception each
-rejection raises. The crate's own 18 unit tests pin down what the diff cannot see — that a
+Verified with 6 traces of ~1,217 operations (**7,300 operations compared, 3,640 of them pool
+operations and 1,428 hash-list operations, 810 rejected by Python**: 435 `ValueError`, 244
+`AssertionError`, 131 `IndexError`): every log line matches, including which exception each
+rejection raises. The crate's own 23 unit tests pin down what the diff cannot see — that a
 popped block really has no links left, that the map drops a key only with its last block, and
 that the null block is never allocated.
 
 What this does **not** cover: the KV-cache event queue, the metrics collector, `BlockPool`'s
-`Request`-based entry points (`cache_full_blocks`, `cache_partial_block`), the
-`BlockHashListWithBlockSize` helper, and the scheduler decisions on top of the pool.
+`Request`-based entry points (`cache_full_blocks`, `cache_partial_block`), and the scheduler
+decisions on top of the pool.
 
 ## Why this is not a performance project
 
@@ -148,11 +158,11 @@ graph capture, not by any of this.
 Recommended order:
 
 1. **Block pool** (`block_pool.py`, `FreeKVCacheBlockQueue`, `KVCacheBlock`,
-   `BlockHashListWithBlockSize`): the mutable state the scheduler touches every step.
-   `FreeKVCacheBlockQueue` and `BlockHashToBlockMap` are now ported and shadow-verified (see
-   above); the remaining piece is `BlockPool` itself, whose events, partial-block hashing and
-   reference counting sit on top of them. This is where a real semantics risk lives, not in
-   hashing.
+   `BlockHashListWithBlockSize`): the mutable state the scheduler touches every step. The free
+   queue, the hash map, the block-size view and `BlockPool` itself are now ported and
+   shadow-verified (see above); what is left of this step is the KV-cache event queue, the
+   metrics collector and the `Request`-based `cache_full_blocks` / `cache_partial_block`
+   entry points. This is where a real semantics risk lives, not in hashing.
 2. **Scheduler decisions** (`sched/scheduler.py`, its own 3,474 lines): must run as a
    shadow first, comparing decisions against the Python scheduler on the same traffic
    before anything is cut over.

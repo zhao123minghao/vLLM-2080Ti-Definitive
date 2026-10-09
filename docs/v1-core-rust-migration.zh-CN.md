@@ -66,13 +66,21 @@ bash tools/check_prefix_hash_parity.sh --num-blocks 200
   `touch` 把命中前缀的缓存块从空闲链表中取出、`unpin` 与复用 watcher 路径、分配时的缓存
   淘汰、每块的哈希元信息与 `cached_block_hashes_by_block` 的额外哈希集合，以及只有"除保留的
   null 块外全部空闲"时才成功的 reset 路径。
+* `BlockHashListWithBlockSize` 与 `resolve_block_hashes` —— 调度器读取哈希时的粒度视图。
+  `hash_block_size` 与某个组的 `block_size` 可能不同；由于每个哈希都已链式覆盖整段前缀，目标块
+  内最后一个 `hash_block_size` 哈希就已经唯一确定了该块，所以转换是一次惰性下标视图：
+  `(idx + 1) * scale_factor - 1`。移植版如实复现了这套下标运算、Python 的负索引与
+  `IndexError`、Python 的切片归一化（含负步长与零步长 `ValueError`），以及
+  `resolve_block_hashes` 的每个分支（尺寸相同、已是视图、细粒度部分命中保留原始哈希、
+  以及整除断言）。这在本部署上不是纸面问题：跑的是混合模型，各 KV cache 组的块大小
+  并不都等于 `hash_block_size`。
 
 `tools/check_block_pool_parity.sh` 把哈希那套方法变成了生成器：
 
 ```bash
 bash tools/check_block_pool_parity.sh
-bash tools/check_block_pool_parity.sh --seeds 8 --num-ops 800 --pool-blocks 24
-# -> block_pool_parity_ok traces=8 operations=6505
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
+# -> block_pool_parity_ok traces=6 operations=7300
 ```
 
 `tools/gen_block_pool_trace.py` 用带种子的随机操作序列驱动**真实的** Python 类，同时写出操作
@@ -80,14 +88,13 @@ bash tools/check_block_pool_parity.sh --seeds 8 --num-ops 800 --pool-blocks 24
 重放同一轨迹，两份日志做 diff。扫多个种子是它区别于单元测试的关键：真正考验重写是否漂移的
 地方，恰恰是那些**拒绝路径**也能一一对应。
 
-已验证：8 条轨迹、每条约 813 步（**共比较 6,505 步，其中 3,957 步是池操作，491 步被
-Python 拒绝**），日志逐行一致，包括每次拒绝所报的异常类型。crate 自带 18 个单测锁住 diff
-看不到的部分——被弹出的块确实不再持有任何指针、映射只在最后一个块被弹出时才删键、null 块
-永不参与分配。
+已验证：6 条轨迹、每条约 1,217 步（**共比较 7,300 步，其中 3,640 步是池操作、1,428 步是哈希
+列表操作，810 步被 Python 拒绝**：435 `ValueError`、244 `AssertionError`、131 `IndexError`），
+日志逐行一致，包括每次拒绝所报的异常类型。crate 自带 23 个单测锁住 diff 看不到的部分——被弹出
+的块确实不再持有任何指针、映射只在最后一个块被弹出时才删键、null 块永不参与分配。
 
 尚未覆盖的部分：KV 缓存事件队列、指标收集器、`BlockPool` 中依赖 `Request` 的入口
-（`cache_full_blocks`、`cache_partial_block`）、`BlockHashListWithBlockSize` 辅助类，以及池之上
-的调度器决策。
+（`cache_full_blocks`、`cache_partial_block`），以及池之上的调度器决策。
 
 ## 为什么这不是一个性能项目
 
@@ -107,7 +114,7 @@ Python 拒绝**），日志逐行一致，包括每次拒绝所报的异常类�
 
 建议顺序如下：
 
-1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。其中 `FreeKVCacheBlockQueue` 与 `BlockHashToBlockMap` 已移植并通过影子校验（见上文）；剩下的是 `BlockPool` 本身，它的事件、部分块哈希与引用计数都建在这两个结构之上。真正的语义风险在这里，不在哈希。
+1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图与 `BlockPool` 本体均已移植并通过影子校验（见上文）；这一步剩下的是 KV 缓存事件队列、指标收集器，以及依赖 `Request` 的 `cache_full_blocks` / `cache_partial_block` 入口。真正的语义风险在这里，不在哈希。
 2. **调度决策**（`sched/scheduler.py`，自身 3,474 行）：必须先以影子模式运行，在同一条流量上把决策序列与 Python 调度器对比，之后才谈切换。
 3. 把 Rust 侧调度器放到 `managed-engine` / M3–M4 的进程工作之后，最后才把 Python 收缩为执行已决定批次的 worker。
 

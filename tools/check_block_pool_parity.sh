@@ -3,9 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Shadow verification of the KV-cache block bookkeeping: the Rust port in
-# `rust/src/kv-pool` must behave exactly like the Python original — `FreeKVCacheBlockQueue`
-# and `BlockHashToBlockMap` from `vllm/v1/core/kv_cache_utils.py` and
-# `vllm/v1/core/block_pool.py`, and the `BlockPool` built on top of them.
+# `rust/src/kv-pool` must behave exactly like the Python original — `FreeKVCacheBlockQueue`,
+# `BlockHashToBlockMap`, `BlockHashListWithBlockSize` and `resolve_block_hashes` from
+# `vllm/v1/core/kv_cache_utils.py`, and the `BlockPool` built on top of them.
 #
 # Python is the source of truth. `tools/gen_block_pool_trace.py` drives the real classes
 # with a seeded random operation sequence and records both the trace and the log it
