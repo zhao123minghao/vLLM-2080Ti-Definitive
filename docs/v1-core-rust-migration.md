@@ -73,8 +73,8 @@ Two findings worth keeping:
 
 ## Block bookkeeping: the state-based half of the port
 
-Hashing is stateless; the block pool is not. `rust/src/kv-pool` (`vllm-kv-pool`) ports the two
-pieces of that state which the scheduler mutates on every step:
+Hashing is stateless; the block pool is not. `rust/src/kv-pool` (`vllm-kv-pool`) ports the
+layers of that state which the scheduler mutates on every step:
 
 * `FreeKVCacheBlockQueue` — the doubly linked list of free blocks, fake head and tail sentinels
   included. Python threads the links through the `KVCacheBlock` objects; the port keeps the same
@@ -86,19 +86,21 @@ pieces of that state which the scheduler mutates on every step:
   group of blocks. The port matches the observable behaviour, including that the key disappears
   only with its last block and that a failed `pop()` leaves the key in place, at the end of the
   key order, the way delete-and-reinsert does in Python.
+* `BlockPool` — the pool built on both, with the semantics that make it interesting:
+  reference counts, the *two* reuse orders of `free_blocks` (uncached blocks are reused LIFO,
+  cached blocks LRU, which is why the same call can land a block at either end of the free
+  list), `touch` pulling a cached block out of the free list for a second request, the
+  `unpin`/reuse-watcher path, cache eviction on allocation, per-block hash metadata plus the
+  extra-hash set of `cached_block_hashes_by_block`, and the reset path that only succeeds when
+  every block but the reserved null block is free.
 
 `tools/check_block_pool_parity.sh` is the hashing method turned into a generator:
 
 ```bash
 bash tools/check_block_pool_parity.sh
-bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1500 --num-blocks 32
-# -> block_pool_parity_ok traces=6 operations=9030
+bash tools/check_block_pool_parity.sh --seeds 8 --num-ops 800 --pool-blocks 24
+# -> block_pool_parity_ok traces=8 operations=6505
 ```
-
-Verified with 6 traces of 1,505 operations each (**9,030 operations compared, 522 of them
-rejected by Python**): every log line matches, including which exception each rejection
-raises. The crate's own 9 unit tests pin down what the diff cannot see — that a popped block
-really has no links left, and that the map drops a key only with its last block.
 
 `tools/gen_block_pool_trace.py` drives the **real** Python classes with a seeded random
 operation sequence and writes both the trace and the log Python produced, one line per
@@ -107,9 +109,15 @@ binary replays the trace and the two logs are diffed. Sweeping seeds is what mak
 shadow check rather than a unit test: the interesting part is that the *rejections* line up as
 well, which is where a rewrite usually drifts.
 
-What this does **not** cover: `BlockPool` itself (block events, partial-block hashing,
-reference counting, `BlockHashListWithBlockSize`) and the scheduler decisions on top of it.
-The ported pieces are the data structures those layers are built from.
+Verified with 8 traces of ~813 operations (**6,505 operations compared, 3,957 of them pool
+operations, 491 rejected by Python**): every log line matches, including which exception each
+rejection raises. The crate's own 18 unit tests pin down what the diff cannot see — that a
+popped block really has no links left, that the map drops a key only with its last block, and
+that the null block is never allocated.
+
+What this does **not** cover: the KV-cache event queue, the metrics collector, `BlockPool`'s
+`Request`-based entry points (`cache_full_blocks`, `cache_partial_block`), the
+`BlockHashListWithBlockSize` helper, and the scheduler decisions on top of the pool.
 
 ## Why this is not a performance project
 

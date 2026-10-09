@@ -6,22 +6,27 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ### KV-cache block bookkeeping: Rust shadow verification
 
-The second step of the `v1/core` migration spike (after prefix-cache hashing) ports the two
-pieces of block state the scheduler mutates every step, and proves them equivalent to Python
-by replaying a recorded operation trace:
+The second step of the `v1/core` migration spike (after prefix-cache hashing) ports the block
+state the scheduler mutates every step, and proves it equivalent to Python by replaying a
+recorded operation trace:
 
 - New `rust/src/kv-pool` (`vllm-kv-pool`): `FreeKVCacheBlockQueue` as an index-addressed
-  doubly linked list with the same fake head/tail sentinels, and `BlockHashToBlockMap` with
-  the same single-or-group semantics. The failure modes are part of the contract —
-  `ValueError` for `popleft()` on an empty queue, `AssertionError` for `popleft_n()` beyond
-  the free count, `RuntimeError` for `remove()` of a block that is not in the list — and the
-  free-block counter is signed because Python's `int` can drift negative.
+  doubly linked list with the same fake head/tail sentinels, `BlockHashToBlockMap` with
+  the same single-or-group semantics, and `BlockPool` on top of both — reference counts, the
+  two reuse orders of `free_blocks` (uncached blocks LIFO, cached blocks LRU), `touch`,
+  `unpin` with its reuse watchers, eviction on allocation, the per-block hash metadata and
+  the reset path. The failure modes are part of the contract — `ValueError` for `popleft()`
+  on an empty queue or `get_new_blocks()` beyond the free count, `AssertionError` for
+  `popleft_n()` beyond the free count, `RuntimeError` for `remove()` of a block that is not
+  in the list — and the free-block counter is signed because Python's `int` can drift
+  negative.
 - New `tools/check_block_pool_parity.sh` plus `tools/gen_block_pool_trace.py`: the recorder
   drives the **real** Python classes with a seeded random operation sequence and writes the
   trace together with the log Python produced, including the exception class of every
   rejected operation; the Rust binary replays the trace and the two logs are diffed.
-  Verified with 6 traces of 1,505 operations: **9,030 operations compared, 522 of them
-  rejections, every line identical**, plus 9 crate unit tests for what a log diff cannot see.
+  Verified with 8 traces: **6,505 operations compared, 3,957 of them pool operations, 491
+  rejections, every line identical**, plus 18 crate unit tests for what a log diff cannot
+  see.
 
 ### One-command validation
 

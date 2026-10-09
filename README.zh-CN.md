@@ -141,7 +141,7 @@ Python 文件参与编译，因此可覆盖 AGENTS.md 里的
 - [依赖审计](docs/dependency-audit.zh-CN.md) —— 真实服务实际导入/映射了什么，以及实测得到的
   固定版本清单 `requirements/definitive-2080ti-measured.txt`。
 - [v1/core Rust 迁移](docs/v1-core-rust-migration.zh-CN.md) —— Rust 重写与 Python 原版的逐字节
-  前缀哈希一致性，以及 KV 缓存块簿记的影子校验（9,030 步记录操作，含被拒绝的路径），以及
+  前缀哈希一致性，以及 KV 缓存块池的影子校验（6,505 步记录操作，含被拒绝的路径），以及
   为什么它属于架构改变而非性能提升。
 
 ## 🧭 Profile 与推荐路线

@@ -154,8 +154,8 @@ Python, which covers the "py_compile <changed-python-files>" step:
   `requirements/definitive-2080ti-measured.txt`.
 - [v1/core Rust migration](docs/v1-core-rust-migration.md) — byte-exact prefix-hash parity
   between the Rust re-implementation and the Python original, plus the shadow verification of
-  the KV-cache block bookkeeping (9,030 recorded operations, rejections included), and why it
-  is an architecture change rather than a speedup.
+  the KV-cache block pool (6,505 recorded operations, rejections included), and why it is an
+  architecture change rather than a speedup.
 
 ## 🧭 Profiles
 

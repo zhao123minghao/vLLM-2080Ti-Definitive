@@ -3,9 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Shadow verification of the KV-cache block bookkeeping: the Rust port in
-# `rust/src/kv-pool` must behave exactly like the Python original
-# (`FreeKVCacheBlockQueue` from `vllm/v1/core/kv_cache_utils.py` and
-# `BlockHashToBlockMap` from `vllm/v1/core/block_pool.py`).
+# `rust/src/kv-pool` must behave exactly like the Python original — `FreeKVCacheBlockQueue`
+# and `BlockHashToBlockMap` from `vllm/v1/core/kv_cache_utils.py` and
+# `vllm/v1/core/block_pool.py`, and the `BlockPool` built on top of them.
 #
 # Python is the source of truth. `tools/gen_block_pool_trace.py` drives the real classes
 # with a seeded random operation sequence and records both the trace and the log it
@@ -14,7 +14,8 @@
 #
 # Usage:
 #   bash tools/check_block_pool_parity.sh [--seeds N] [--num-ops N] [--num-blocks N]
-#                                         [--key-space N] [--skip-build] [--skip-tests]
+#                                         [--key-space N] [--pool-blocks N]
+#                                         [--pool-caching 0|1] [--skip-build] [--skip-tests]
 #
 # Exits non-zero on the first mismatch (the diff is printed).
 
@@ -36,6 +37,8 @@ SEEDS=4
 NUM_OPS=400
 NUM_BLOCKS=16
 KEY_SPACE=6
+POOL_BLOCKS=24
+POOL_CACHING=1
 SKIP_BUILD=0
 SKIP_TESTS=0
 
@@ -45,6 +48,8 @@ while [[ $# -gt 0 ]]; do
     --num-ops) NUM_OPS="$2"; shift 2 ;;
     --num-blocks) NUM_BLOCKS="$2"; shift 2 ;;
     --key-space) KEY_SPACE="$2"; shift 2 ;;
+    --pool-blocks) POOL_BLOCKS="$2"; shift 2 ;;
+    --pool-caching) POOL_CACHING="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
     -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -104,6 +109,8 @@ for seed in $(seq 0 $((SEEDS - 1))); do
     --num-blocks "$NUM_BLOCKS" \
     --num-ops "$NUM_OPS" \
     --key-space "$KEY_SPACE" \
+    --pool-blocks "$POOL_BLOCKS" \
+    --pool-caching "$POOL_CACHING" \
     --seed "$seed")"
   ops="$(printf '%s\n' "$generated" | awk -F': ' '/^operations:/ {print $2}')"
   operations=$((operations + ops))

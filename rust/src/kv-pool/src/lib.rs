@@ -16,6 +16,8 @@
 //! * [`BlockHashToBlockMap`] — the map of the same name in `vllm/v1/core/block_pool.py`,
 //!   where one hash key holds either a single block or an insertion-ordered group of
 //!   blocks.
+//! * [`BlockPool`] — the pool built on both of them: reference counts, the free-list order
+//!   after `free_blocks`, cache eviction, the reuse watchers and the reset path.
 //!
 //! Validation lives in `tools/check_block_pool_parity.sh`: `tools/gen_block_pool_trace.py`
 //! drives the real Python classes with a seeded random operation sequence and records
@@ -26,6 +28,10 @@
 //! ([`PyError`]), because "raises the same error" is part of the contract.
 
 use std::fmt::Write as _;
+
+pub mod pool;
+
+pub use pool::BlockPool;
 
 /// The Python exception a rejected operation corresponds to.
 ///
@@ -382,6 +388,7 @@ pub fn replay(trace: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut queue: Option<FreeQueue> = None;
     let mut map = BlockHashToBlockMap::new();
+    let mut pool: Option<BlockPool> = None;
 
     for (index, raw) in trace.lines().enumerate() {
         let line = raw.trim();
@@ -389,7 +396,7 @@ pub fn replay(trace: &str) -> Result<String, String> {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        let tokens = apply(&parts, &mut queue, &mut map)
+        let tokens = apply(&parts, &mut queue, &mut map, &mut pool)
             .map_err(|message| format!("line {}: {message}", index + 1))?;
         writeln!(out, "{line} -> {}", tokens.join(" ")).expect("writing to a String");
     }
@@ -400,12 +407,19 @@ fn apply(
     parts: &[&str],
     queue: &mut Option<FreeQueue>,
     map: &mut BlockHashToBlockMap,
+    pool: &mut Option<BlockPool>,
 ) -> Result<Vec<String>, String> {
     let op = parts[0];
     let ids = |from: usize| -> Result<Vec<usize>, String> {
         parts[from..]
             .iter()
             .map(|token| parse_usize(token))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let pool_ids = |from: usize| -> Result<Vec<u64>, String> {
+        parts[from..]
+            .iter()
+            .map(|token| parse_u64(token))
             .collect::<Result<Vec<_>, _>>()
     };
 
@@ -508,6 +522,116 @@ fn apply(
                 ok_value(dump)
             })
         }
+        "pool_init" => {
+            let num_blocks = parse_usize(need(parts, 1, "pool_init <num_blocks> <0|1>")?)?;
+            let enable_caching = parse_bool(need(parts, 2, "pool_init <num_blocks> <0|1>")?)?;
+            match BlockPool::new(num_blocks, enable_caching) {
+                Ok(created) => {
+                    *pool = Some(created);
+                    Ok(ok())
+                }
+                Err(error) => Ok(err(error)),
+            }
+        }
+        "pool_new" => {
+            let num_blocks = parse_usize(need(parts, 1, "pool_new <n>")?)?;
+            match pool {
+                Some(pool) => Ok(match pool.get_new_blocks(num_blocks) {
+                    Ok(blocks) => ok_values(blocks.iter().map(u64::to_string)),
+                    Err(error) => err(error),
+                }),
+                None => Err("pool_new before pool_init".to_string()),
+            }
+        }
+        "pool_free" => {
+            let blocks = pool_ids(1)?;
+            match pool {
+                Some(pool) => Ok(result(pool.free_blocks(&blocks))),
+                None => Err("pool_free before pool_init".to_string()),
+            }
+        }
+        "pool_unpin" => {
+            let blocks = pool_ids(1)?;
+            match pool {
+                Some(pool) => Ok(result(pool.unpin_blocks(&blocks))),
+                None => Err("pool_unpin before pool_init".to_string()),
+            }
+        }
+        "pool_touch" => {
+            let blocks = pool_ids(1)?;
+            match pool {
+                Some(pool) => Ok(result(pool.touch(&blocks))),
+                None => Err("pool_touch before pool_init".to_string()),
+            }
+        }
+        "pool_evict" => {
+            let blocks = pool_ids(1)?;
+            match pool {
+                Some(pool) => Ok(result(pool.evict_blocks(&blocks))),
+                None => Err("pool_evict before pool_init".to_string()),
+            }
+        }
+        "pool_writable" => {
+            let block = parse_u64(need(parts, 1, "pool_writable <block_id>")?)?;
+            match pool {
+                Some(pool) => Ok(ok_value(
+                    if pool.is_block_writable(block) {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                    .to_string(),
+                )),
+                None => Err("pool_writable before pool_init".to_string()),
+            }
+        }
+        "pool_set_hash" => {
+            let usage = "pool_set_hash <block_id> <key> <num_tokens|->";
+            let block = parse_u64(need(parts, 1, usage)?)?;
+            let key = hex_decode(need(parts, 2, usage)?)?;
+            let num_tokens = match need(parts, 3, usage)? {
+                "-" => None,
+                token => Some(parse_i64(token)?),
+            };
+            match pool {
+                Some(pool) => Ok(result(pool.insert_block_hash(&key, block, num_tokens))),
+                None => Err("pool_set_hash before pool_init".to_string()),
+            }
+        }
+        "pool_cached" => {
+            let key = hex_decode(need(parts, 1, "pool_cached <key>")?)?;
+            match pool {
+                Some(pool) => Ok(match pool.get_cached_block(&key) {
+                    Some(block) => ok_value(block.to_string()),
+                    None => ok_value("-".to_string()),
+                }),
+                None => Err("pool_cached before pool_init".to_string()),
+            }
+        }
+        "pool_num_free" => match pool {
+            Some(pool) => Ok(ok_value(pool.num_free_blocks().to_string())),
+            None => Err("pool_num_free before pool_init".to_string()),
+        },
+        "pool_usage" => match pool {
+            // Six decimals on both sides: Python computes the same IEEE double, and the
+            // integer zero it returns for a one-block pool formats identically.
+            Some(pool) => Ok(ok_value(format!("{:.6}", pool.usage()))),
+            None => Err("pool_usage before pool_init".to_string()),
+        },
+        "pool_order" => match pool {
+            Some(pool) => Ok(ok_values(pool.free_order().iter().map(u64::to_string))),
+            None => Err("pool_order before pool_init".to_string()),
+        },
+        "pool_reset" => match pool {
+            Some(pool) => Ok(ok_value(
+                if pool.reset_prefix_cache() { "1" } else { "0" }.to_string(),
+            )),
+            None => Err("pool_reset before pool_init".to_string()),
+        },
+        "pool_dump" => match pool {
+            Some(pool) => Ok(ok_value(pool.dump())),
+            None => Err("pool_dump before pool_init".to_string()),
+        },
         other => Err(format!("unknown operation `{other}`")),
     }
 }
@@ -527,6 +651,20 @@ fn parse_usize(token: &str) -> Result<usize, String> {
 
 fn parse_u64(token: &str) -> Result<u64, String> {
     token.parse::<u64>().map_err(|_| format!("expected a block id, got `{token}`"))
+}
+
+fn parse_i64(token: &str) -> Result<i64, String> {
+    token
+        .parse::<i64>()
+        .map_err(|_| format!("expected a token count, got `{token}`"))
+}
+
+fn parse_bool(token: &str) -> Result<bool, String> {
+    match token {
+        "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        _ => Err(format!("expected 0 or 1, got `{token}`")),
+    }
 }
 
 fn ok() -> Vec<String> {
@@ -669,6 +807,39 @@ map_insert a1 5 -> ok
 map_get_one a1 -> ok 5
 map_pop a1 4 -> ok -
 map_dump -> ok a1:5
+";
+        assert_eq!(replay(trace).unwrap(), expected);
+    }
+
+    #[test]
+    fn replay_drives_the_pool_operations() {
+        let trace = "\
+pool_init 4 1
+pool_order
+pool_new 2
+pool_set_hash 1 aa 32
+pool_cached aa
+pool_writable 1
+pool_free 1 2
+pool_num_free
+pool_usage
+pool_new 5
+pool_reset
+pool_dump
+";
+        let expected = "\
+pool_init 4 1 -> ok
+pool_order -> ok 1 2 3
+pool_new 2 -> ok 1 2
+pool_set_hash 1 aa 32 -> ok
+pool_cached aa -> ok 1
+pool_writable 1 -> ok 0
+pool_free 1 2 -> ok
+pool_num_free -> ok 3
+pool_usage -> ok 0.000000
+pool_new 5 -> err ValueError
+pool_reset -> ok 1
+pool_dump -> ok free=3 map=0 watchers=- 0:0:-:-:- 1:0:-:-:- 2:0:-:-:- 3:0:-:-:-
 ";
         assert_eq!(replay(trace).unwrap(), expected);
     }
