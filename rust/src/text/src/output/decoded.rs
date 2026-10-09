@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 use vllm_engine_core_client::AbortCause;
 use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_llm::{FinishReason, GenerateOutput, TokenUsage};
 use vllm_tokenizer::{DecodedText, DynTokenizer, IncrementalDecoder};
 
@@ -45,6 +46,9 @@ impl Default for TextDecodeOptions {
 pub struct Finished {
     pub usage: TokenUsage,
     pub finish_reason: FinishReason,
+    /// Per-request speculative-decoding acceptance metrics reported by the
+    /// engine, when the request ran speculative decoding.
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
     /// Connector-specific encoder cache transfer parameters for disaggregated
@@ -169,6 +173,7 @@ pub async fn decoded_text_event_stream(
 
         let kv_transfer_params = output.kv_transfer_params;
         let ec_transfer_params = output.ec_transfer_params;
+        let spec_decode_metrics = output.spec_decode_metrics;
         let mut finish_reason = output.finish_reason;
         let mut stop_str_matched = false;
         let suppress_terminal_stop_token = finish_reason.as_ref().is_some_and(|r| r.is_stop())
@@ -291,6 +296,7 @@ pub async fn decoded_text_event_stream(
                         cached_token_count,
                     },
                     finish_reason: reason,
+                    spec_decode_metrics,
                     kv_transfer_params,
                     ec_transfer_params,
                 })),
@@ -470,6 +476,7 @@ mod tests {
                                 cached_token_count: 0,
                             },
                             finish_reason: FinishReason::Length,
+                            spec_decode_metrics: None,
                             kv_transfer_params: None,
                             ec_transfer_params: None,
                         }),
@@ -501,6 +508,7 @@ mod tests {
                             finish_reason: FinishReason::Stop(Some(StopReason::TokenId(
                                 b'!' as u32,
                             ))),
+                            spec_decode_metrics: None,
                             kv_transfer_params: None,
                             ec_transfer_params: None,
                         }),

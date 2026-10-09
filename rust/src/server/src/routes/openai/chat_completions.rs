@@ -39,8 +39,8 @@ use crate::routes::openai::utils::logprobs::{
     decoded_logprobs_to_openai_chat, prompt_logprobs_to_maps,
 };
 use crate::routes::openai::utils::types::{
-    ChatLogProbs, FunctionCallDelta, FunctionCallResponse, StreamResponseEnvelope, ToolCall,
-    ToolCallDelta, Usage,
+    ChatLogProbs, FunctionCallDelta, FunctionCallResponse, PerRequestMetrics,
+    StreamResponseEnvelope, ToolCall, ToolCallDelta, Usage,
 };
 use crate::routes::openai::utils::usage::ContinuousUsage;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
@@ -159,6 +159,7 @@ async fn collect_chat_completion(
         token_ids,
         usage,
         finish_reason,
+        spec_decode_metrics,
         kv_transfer_params,
         ec_transfer_params,
     } = collected;
@@ -241,6 +242,7 @@ async fn collect_chat_completion(
         prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
         kv_transfer_params,
         ec_transfer_params,
+        metrics: PerRequestMetrics::from_spec_decode_metrics(spec_decode_metrics.as_ref()),
     })
 }
 
@@ -429,6 +431,7 @@ async fn chat_completion_chunk_stream(
             Ok(ChatEvent::Done {
                 usage: final_usage,
                 finish_reason,
+                spec_decode_metrics,
                 ..
             }) => {
                 if enable_log_requests {
@@ -475,6 +478,7 @@ async fn chat_completion_chunk_stream(
                     y.yield_ok(usage_chunk(
                         &envelope,
                         Usage::from_token_usage(final_usage, enable_prompt_tokens_details),
+                        PerRequestMetrics::from_spec_decode_metrics(spec_decode_metrics.as_deref()),
                     ))
                     .await;
                 }
@@ -496,9 +500,11 @@ async fn chat_completion_chunk_stream(
 fn usage_chunk(
     envelope: &Arc<StreamResponseEnvelope>,
     usage: Usage,
+    metrics: Option<PerRequestMetrics>,
 ) -> ChatCompletionStreamResponse {
     let mut chunk = ChatCompletionStreamResponse::new(envelope);
     chunk.usage = Some(usage);
+    chunk.metrics = metrics;
     chunk
 }
 
@@ -963,6 +969,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 1, 1),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1042,6 +1049,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 1, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1096,6 +1104,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 2, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1176,6 +1185,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 2, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1308,6 +1318,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 4, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1386,6 +1397,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 1, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1469,6 +1481,7 @@ mod tests {
                     reasoning_tokens: 2,
                 },
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1540,6 +1553,7 @@ mod tests {
                     reasoning_tokens: 2,
                 },
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -1594,6 +1608,7 @@ mod tests {
                 message: Default::default(),
                 usage: done_usage(1, 1, 0),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),

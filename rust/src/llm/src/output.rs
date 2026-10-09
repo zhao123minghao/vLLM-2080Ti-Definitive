@@ -12,6 +12,7 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
 use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -39,6 +40,9 @@ pub struct CollectedGenerateOutput {
     pub logprobs: Option<Logprobs>,
     pub finish_reason: FinishReason,
     pub usage: TokenUsage,
+    /// Per-request speculative-decoding acceptance metrics, present only when
+    /// the engine computed them and the request was speculative.
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
     /// Connector-specific encoder cache transfer parameters for disaggregated
@@ -150,6 +154,9 @@ pub struct GenerateOutput {
     pub finish_reason: Option<FinishReason>,
     /// Number of prompt tokens served from cache, when reported by prefill stats.
     pub cached_token_count: usize,
+    /// Per-request speculative-decoding acceptance metrics, set on the final
+    /// output when the engine reports them.
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
     /// Connector-specific encoder cache transfer parameters for disaggregated
@@ -200,6 +207,7 @@ impl GenerateOutput {
             logprobs: None,
             finish_reason,
             cached_token_count: 0,
+            spec_decode_metrics: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
         }
@@ -289,6 +297,7 @@ impl Stream for GenerateOutputStream {
             logprobs,
             finish_reason,
             cached_token_count,
+            spec_decode_metrics: raw.spec_decode_metrics,
             kv_transfer_params: raw.kv_transfer_params,
             ec_transfer_params: raw.ec_transfer_params,
         };
@@ -372,6 +381,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             output_token_count: 0,
                             cached_token_count,
                         },
+                        spec_decode_metrics: None,
                         kv_transfer_params: None,
                         ec_transfer_params: None,
                     });
@@ -387,6 +397,7 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                     };
                     collected.kv_transfer_params = output.kv_transfer_params;
                     collected.ec_transfer_params = output.ec_transfer_params;
+                    collected.spec_decode_metrics = output.spec_decode_metrics;
                     return Ok(collected);
                 }
             }

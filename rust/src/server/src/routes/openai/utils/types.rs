@@ -8,6 +8,7 @@ use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use vllm_chat::ChatTokenUsage;
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 
 // ============================================================================
 // Constants
@@ -490,6 +491,135 @@ pub struct CompletionTokenUsageInfo {
     pub reasoning_tokens: usize,
 }
 
+// ============================================================================
+// Per-request metrics
+// ============================================================================
+
+/// Per-request speculative-decoding acceptance metrics.
+///
+/// Mirrors the Python `SpeculativeDecodingMetrics` response model and the
+/// `RequestSpecDecodeMetrics.to_dict` conversion that feeds it: the acceptance
+/// histogram is dense, indexed by the number of accepted draft tokens `j`, and
+/// `mean_acceptance_length` includes the always-accepted bonus token.
+///
+/// Original Python definitions: `vllm/entrypoints/generate/base/protocol.py`
+/// and `vllm/v1/metrics/stats.py`.
+///
+/// Do not skip serializing `None` fields here: non-streaming response types
+/// should serialize `None` as explicit `null`, matching the Python frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeculativeDecodingMetrics {
+    pub mean_acceptance_length: f64,
+    pub draft_acceptance_rate: f64,
+    pub acceptance_histogram: Vec<u64>,
+    pub num_spec_steps: u64,
+    pub num_accepted_draft_tokens: u64,
+    pub num_draft_tokens: u64,
+    pub num_spec_tokens: u32,
+    /// Ordered per-verify-step arrays, populated at the `detailed` level only.
+    pub per_step_accepted: Option<Vec<u64>>,
+    pub per_step_drafted: Option<Vec<u64>>,
+}
+
+impl SpeculativeDecodingMetrics {
+    /// Derive the response payload from the engine-reported wire metrics.
+    pub fn from_wire(wire: &SpecDecodeMetrics) -> Self {
+        let num_spec_steps: u64 = wire.histogram.iter().sum();
+        let num_accepted: u64 = wire
+            .histogram
+            .iter()
+            .enumerate()
+            .map(|(accepted, count)| accepted as u64 * count)
+            .sum();
+        let mean_acceptance_length = if num_spec_steps > 0 {
+            1.0 + num_accepted as f64 / num_spec_steps as f64
+        } else {
+            1.0
+        };
+        let draft_acceptance_rate = if wire.num_draft_tokens > 0 {
+            num_accepted as f64 / wire.num_draft_tokens as f64
+        } else {
+            0.0
+        };
+
+        Self {
+            mean_acceptance_length,
+            draft_acceptance_rate,
+            acceptance_histogram: wire.histogram.clone(),
+            num_spec_steps,
+            num_accepted_draft_tokens: num_accepted,
+            num_draft_tokens: wire.num_draft_tokens,
+            num_spec_tokens: wire.num_spec_tokens,
+            per_step_accepted: (!wire.per_step_accepted.is_empty())
+                .then(|| wire.per_step_accepted.clone()),
+            per_step_drafted: (!wire.per_step_drafted.is_empty())
+                .then(|| wire.per_step_drafted.clone()),
+        }
+    }
+}
+
+/// Per-request timing and speculative-decoding metrics.
+///
+/// Mirrors the Python `PerRequestMetrics` response model. The Rust frontend
+/// does not compute per-request timings yet, so those fields serialize as
+/// `null`; the Python frontend emits the same `null`s whenever per-request
+/// timing metrics are unavailable. The speculative-decoding block is populated
+/// only when the engine reported it.
+///
+/// Original Python definition: `vllm/entrypoints/generate/base/protocol.py`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PerRequestMetrics {
+    pub time_to_first_token_ms: Option<f64>,
+    pub generation_time_ms: Option<f64>,
+    pub queue_time_ms: Option<f64>,
+    pub mean_itl_ms: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub speculative_decoding: Option<SpeculativeDecodingMetrics>,
+}
+
+impl PerRequestMetrics {
+    /// Build the response `metrics` block from one request's engine-reported
+    /// spec-decode metrics, or `None` when the engine reported none.
+    pub fn from_spec_decode_metrics(wire: Option<&SpecDecodeMetrics>) -> Option<Self> {
+        wire.map(|wire| Self {
+            speculative_decoding: Some(SpeculativeDecodingMetrics::from_wire(wire)),
+            ..Default::default()
+        })
+    }
+
+    /// Serialize this block for a streaming chunk, dropping `null` fields the
+    /// way the Python frontend's streaming responses do
+    /// (`model_dump_json(exclude_none=True)`). Non-streaming responses keep the
+    /// explicit `null`s instead.
+    pub fn to_stream_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("per-request metrics must serialize");
+        if let Some(object) = value.as_object_mut() {
+            object.retain(|_, field| !field.is_null());
+        }
+        if let Some(spec) = value.get_mut("speculative_decoding")
+            && let Some(object) = spec.as_object_mut()
+        {
+            object.retain(|_, field| !field.is_null());
+        }
+        value
+    }
+}
+
+/// Serialize an optional `metrics` block for a streaming chunk, omitting it
+/// entirely when absent and dropping its `null` fields when present.
+pub fn serialize_stream_metrics<S>(
+    metrics: &Option<PerRequestMetrics>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match metrics {
+        None => serializer.serialize_none(),
+        Some(metrics) => metrics.to_stream_json().serialize(serializer),
+    }
+}
+
 #[cfg(test)]
 mod usage_tests {
     use vllm_chat::ChatTokenUsage;
@@ -714,5 +844,121 @@ pub trait Normalizable {
     /// Normalize the request by applying defaults and transformations.
     fn normalize(&mut self) {
         // Default: no-op
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
+
+    use super::{PerRequestMetrics, SpeculativeDecodingMetrics};
+
+    /// Reference values measured from the Python frontend on the same MTP route
+    /// (`per_step_accepted=[1,3,1,4,3]`, `per_step_drafted=[4,4,4,4,4]`,
+    /// `mean_acceptance_length=3.4`, `draft_acceptance_rate=0.6`).
+    fn detailed_wire_metrics() -> SpecDecodeMetrics {
+        SpecDecodeMetrics {
+            num_spec_tokens: 4,
+            histogram: vec![0, 2, 0, 2, 1],
+            num_draft_tokens: 20,
+            per_step_accepted: vec![1, 3, 1, 4, 3],
+            per_step_drafted: vec![4, 4, 4, 4, 4],
+        }
+    }
+
+    #[test]
+    fn spec_decode_metrics_match_python_to_dict() {
+        let metrics = SpeculativeDecodingMetrics::from_wire(&detailed_wire_metrics());
+
+        assert_eq!(metrics.num_spec_steps, 5);
+        assert_eq!(metrics.num_accepted_draft_tokens, 12);
+        assert_eq!(metrics.num_draft_tokens, 20);
+        assert_eq!(metrics.num_spec_tokens, 4);
+        assert_eq!(metrics.acceptance_histogram, vec![0, 2, 0, 2, 1]);
+        assert!((metrics.mean_acceptance_length - 3.4).abs() < 1e-12);
+        assert!((metrics.draft_acceptance_rate - 0.6).abs() < 1e-12);
+        assert_eq!(metrics.per_step_accepted, Some(vec![1, 3, 1, 4, 3]));
+        assert_eq!(metrics.per_step_drafted, Some(vec![4, 4, 4, 4, 4]));
+    }
+
+    #[test]
+    fn summary_level_omits_per_step_arrays() {
+        let wire = SpecDecodeMetrics {
+            per_step_accepted: Vec::new(),
+            per_step_drafted: Vec::new(),
+            ..detailed_wire_metrics()
+        };
+
+        let metrics = SpeculativeDecodingMetrics::from_wire(&wire);
+
+        assert!(metrics.per_step_accepted.is_none());
+        assert!(metrics.per_step_drafted.is_none());
+    }
+
+    #[test]
+    fn empty_histogram_reports_neutral_acceptance() {
+        let wire = SpecDecodeMetrics {
+            num_spec_tokens: 4,
+            histogram: Vec::new(),
+            num_draft_tokens: 0,
+            ..Default::default()
+        };
+
+        let metrics = SpeculativeDecodingMetrics::from_wire(&wire);
+
+        assert_eq!(metrics.num_spec_steps, 0);
+        assert_eq!(metrics.num_accepted_draft_tokens, 0);
+        assert_eq!(metrics.mean_acceptance_length, 1.0);
+        assert_eq!(metrics.draft_acceptance_rate, 0.0);
+    }
+
+    #[test]
+    fn absent_wire_metrics_produce_no_block() {
+        assert!(PerRequestMetrics::from_spec_decode_metrics(None).is_none());
+    }
+
+    #[test]
+    fn response_block_serializes_null_timings_and_spec_block() {
+        let block = PerRequestMetrics::from_spec_decode_metrics(Some(&detailed_wire_metrics()))
+            .expect("spec metrics should produce a block");
+        let json = serde_json::to_value(&block).expect("metrics must serialize");
+
+        assert!(json["time_to_first_token_ms"].is_null());
+        assert!(json["generation_time_ms"].is_null());
+        assert!(json["queue_time_ms"].is_null());
+        assert!(json["mean_itl_ms"].is_null());
+        assert!(json["tokens_per_second"].is_null());
+        assert_eq!(json["speculative_decoding"]["num_spec_steps"], 5);
+        assert_eq!(
+            json["speculative_decoding"]["mean_acceptance_length"],
+            serde_json::json!(3.4)
+        );
+    }
+
+    /// Streaming chunks drop `null` fields, like Python's
+    /// `model_dump_json(exclude_none=True)`; non-streaming responses keep them.
+    #[test]
+    fn stream_form_drops_null_fields_only() {
+        let block = PerRequestMetrics::from_spec_decode_metrics(Some(&detailed_wire_metrics()))
+            .expect("spec metrics should produce a block");
+        let json = block.to_stream_json();
+        let object = json.as_object().expect("stream metrics are an object");
+
+        assert_eq!(object.len(), 1);
+        assert!(object.contains_key("speculative_decoding"));
+        assert!(!object.contains_key("time_to_first_token_ms"));
+        assert_eq!(json["speculative_decoding"]["num_draft_tokens"], 20);
+
+        let summary = SpecDecodeMetrics {
+            per_step_accepted: Vec::new(),
+            per_step_drafted: Vec::new(),
+            ..detailed_wire_metrics()
+        };
+        let block = PerRequestMetrics::from_spec_decode_metrics(Some(&summary))
+            .expect("spec metrics should produce a block");
+        let json = block.to_stream_json();
+        let spec = json["speculative_decoding"].as_object().expect("spec block is an object");
+        assert!(!spec.contains_key("per_step_accepted"));
+        assert!(!spec.contains_key("per_step_drafted"));
     }
 }

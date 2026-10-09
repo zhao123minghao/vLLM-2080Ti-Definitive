@@ -8,6 +8,7 @@ use thiserror_ext::AsReport as _;
 use tonic::Status;
 use uuid::Uuid;
 use vllm_engine_core_client::protocol::output::StopReason;
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams;
 use vllm_text::{
     DecodedLogprobs, DecodedPromptLogprobs, FinishReason, Finished, Prompt, PromptTruncation,
@@ -362,7 +363,19 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> Result<pb::FinishIn
         stop_reason,
         kv_transfer_params: finished.kv_transfer_params.as_ref().and_then(json_to_proto_struct),
         ec_transfer_params: finished.ec_transfer_params.as_ref().and_then(json_to_proto_struct),
+        spec_decode_metrics: finished.spec_decode_metrics.as_ref().map(to_spec_decode_metrics),
     })
+}
+
+/// Convert engine-reported spec-decode metrics into their proto form.
+fn to_spec_decode_metrics(wire: &SpecDecodeMetrics) -> pb::SpecDecodeMetrics {
+    pb::SpecDecodeMetrics {
+        num_spec_tokens: wire.num_spec_tokens,
+        histogram: wire.histogram.clone(),
+        num_draft_tokens: wire.num_draft_tokens,
+        per_step_accepted: wire.per_step_accepted.clone(),
+        per_step_drafted: wire.per_step_drafted.clone(),
+    }
 }
 
 // ========================================================================================
@@ -626,6 +639,7 @@ mod tests {
                 cached_token_count: 0,
             },
             finish_reason: reason,
+            spec_decode_metrics: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
         }

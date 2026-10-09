@@ -33,7 +33,7 @@ use super::utils::logprobs::{
     collected_logprobs_to_openai, decoded_logprobs_to_openai, decoded_prompt_logprobs_to_openai,
     prompt_logprobs_to_maps, text_len,
 };
-use super::utils::types::{StreamResponseEnvelope, Usage};
+use super::utils::types::{PerRequestMetrics, StreamResponseEnvelope, Usage};
 use crate::config::ApiServerOptions;
 use crate::error::{ApiError, bail_server_error, server_error, text_submit_error};
 use crate::lora::LoraModelResolution;
@@ -228,6 +228,9 @@ async fn collect_completion(
         system_fingerprint: None,
         kv_transfer_params: collected.kv_transfer_params,
         ec_transfer_params: collected.ec_transfer_params,
+        metrics: PerRequestMetrics::from_spec_decode_metrics(
+            collected.spec_decode_metrics.as_ref(),
+        ),
     })
 }
 
@@ -355,6 +358,9 @@ async fn completion_chunk_stream(
                                     finished.usage,
                                     enable_prompt_tokens_details,
                                 ),
+                                PerRequestMetrics::from_spec_decode_metrics(
+                                    finished.spec_decode_metrics.as_ref(),
+                                ),
                             )))
                             .await;
                         }
@@ -407,6 +413,9 @@ async fn completion_chunk_stream(
                         y.yield_ok(CompletionSseChunk::Usage(usage_chunk(
                             &envelope,
                             Usage::from_token_usage(finished.usage, enable_prompt_tokens_details),
+                            PerRequestMetrics::from_spec_decode_metrics(
+                                finished.spec_decode_metrics.as_ref(),
+                            ),
                         )))
                         .await;
                     }
@@ -502,9 +511,14 @@ fn prompt_only_logprobs_to_openai(
     ))
 }
 
-fn usage_chunk(envelope: &Arc<StreamResponseEnvelope>, usage: Usage) -> CompletionStreamResponse {
+fn usage_chunk(
+    envelope: &Arc<StreamResponseEnvelope>,
+    usage: Usage,
+    metrics: Option<PerRequestMetrics>,
+) -> CompletionStreamResponse {
     let mut chunk = CompletionStreamResponse::new(envelope);
     chunk.usage = Some(usage);
+    chunk.metrics = metrics;
     chunk
 }
 
@@ -692,6 +706,7 @@ mod tests {
                     finish_reason: FinishReason::Repetition(Some(StopReason::Text(
                         "repetition_detected".to_string(),
                     ))),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -804,6 +819,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::Length,
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -856,6 +872,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::Length,
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -911,6 +928,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::Length,
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -983,6 +1001,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::Length,
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -1057,6 +1076,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::Length,
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),

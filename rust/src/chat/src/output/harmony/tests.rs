@@ -56,6 +56,7 @@ fn finished() -> Finished {
             cached_token_count: 0,
         },
         finish_reason: FinishReason::stop_eos(),
+        spec_decode_metrics: None,
         kv_transfer_params: None,
         ec_transfer_params: None,
     }
@@ -131,6 +132,7 @@ fn interrupted_final_message_is_preserved() {
                 cached_token_count: 0,
             }),
             finish_reason: FinishReason::stop_eos(),
+            spec_decode_metrics: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
         })
@@ -182,6 +184,7 @@ fn interrupted_analysis_message_is_preserved() {
                 cached_token_count: 0,
             }),
             finish_reason: FinishReason::stop_eos(),
+            spec_decode_metrics: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
         })

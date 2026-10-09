@@ -15,9 +15,10 @@ use vllm_text::TruncationSide;
 
 use crate::routes::openai::utils::structured_outputs::ResponseFormat;
 use crate::routes::openai::utils::types::{
-    ChatLogProbs, ChatMessage, Normalizable, PromptLogprobs, StreamOptions, StreamResponseEnvelope,
-    StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, Usage, default_true,
-    deserialize_request_top_k, validate_messages, validate_stop, validate_top_p_value,
+    ChatLogProbs, ChatMessage, Normalizable, PerRequestMetrics, PromptLogprobs, StreamOptions,
+    StreamResponseEnvelope, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, Usage,
+    default_true, deserialize_request_top_k, validate_messages, validate_stop,
+    validate_top_p_value,
 };
 
 /// vLLM-compatible request type for the Chat Completions API.
@@ -351,6 +352,9 @@ pub(super) struct ChatCompletionResponse {
     pub prompt_token_ids: Option<Vec<u32>>,
     pub kv_transfer_params: Option<Value>,
     pub ec_transfer_params: Option<Value>,
+    /// Per-request timing and spec-decode metrics; `null` when the engine
+    /// reported none, mirroring the Python frontend.
+    pub metrics: Option<PerRequestMetrics>,
 }
 
 /// Mirrors the Python vLLM `ChatCompletionResponseChoice` class.
@@ -394,6 +398,12 @@ pub(super) struct ChatCompletionStreamResponse {
     pub choices: Vec<ChatCompletionStreamChoice>,
     pub usage: Option<Usage>,
     pub prompt_token_ids: Option<Vec<u32>>,
+    /// Metrics ride only on the final usage chunk, and only when usage
+    /// reporting is enabled, mirroring the Python frontend. Streamed as a value
+    /// so the `null` timing fields are dropped, matching the Python frontend's
+    /// `exclude_none=True` streaming serialization.
+    #[serde(serialize_with = "crate::routes::openai::utils::types::serialize_stream_metrics")]
+    pub metrics: Option<PerRequestMetrics>,
 }
 
 impl ChatCompletionStreamResponse {
@@ -404,6 +414,7 @@ impl ChatCompletionStreamResponse {
             choices: Vec::new(),
             usage: None,
             prompt_token_ids: None,
+            metrics: None,
         }
     }
 }

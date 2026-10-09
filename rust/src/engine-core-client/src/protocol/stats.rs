@@ -106,6 +106,39 @@ pub struct PrefillStats {
     pub num_cache_creation_tokens: u32,
 }
 
+/// Per-sequence speculative-decoding statistics for one request.
+///
+/// Accumulates, over one sequence's verify steps, a histogram of accepted
+/// draft-token counts (`j`, draft-only) and the total number of proposed draft
+/// tokens. At the `detailed` level it also records the ordered per-step
+/// accepted/proposed counts; `summary` leaves both vectors empty.
+///
+/// Encoded by the Python engine as a map (named fields), like `PrefillStats`,
+/// rather than in the array-like form used by `EngineCoreOutput` itself.
+///
+/// Original Python definition: `vllm/v1/metrics/stats.py`
+/// (`RequestSpecDecodeMetrics`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecDecodeMetrics {
+    /// Configured `num_speculative_tokens` (the max `k`); also the histogram's
+    /// upper bound, since the histogram has length `num_spec_tokens + 1`.
+    #[serde(default)]
+    pub num_spec_tokens: u32,
+    /// Dense counts indexed by accepted draft tokens `j`, excluding the
+    /// always-accepted bonus token.
+    #[serde(default)]
+    pub histogram: Vec<u64>,
+    /// Total proposed draft tokens, after the grammar-invalidated adjustment.
+    #[serde(default)]
+    pub num_draft_tokens: u64,
+    /// Ordered accepted-draft count per verify step (`detailed` only).
+    #[serde(default)]
+    pub per_step_accepted: Vec<u64>,
+    /// Ordered proposed-draft count per verify step (`detailed` only).
+    #[serde(default)]
+    pub per_step_drafted: Vec<u64>,
+}
+
 /// Stats for debugging the metrics calculation.
 ///
 /// Original Python definition:

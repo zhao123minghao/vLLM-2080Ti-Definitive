@@ -10,6 +10,7 @@
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_text::DecodedLogprobs;
 
 use super::{AssistantEvent, AssistantEventStream};
@@ -150,6 +151,7 @@ impl StructuredEventState {
         &mut self,
         usage: ChatTokenUsage,
         finish_reason: FinishReason,
+        spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
         kv_transfer_params: Option<serde_json::Value>,
         ec_transfer_params: Option<serde_json::Value>,
     ) -> Result<Vec<ChatEvent>> {
@@ -160,6 +162,7 @@ impl StructuredEventState {
             message: self.message.clone(),
             usage,
             finish_reason,
+            spec_decode_metrics,
             kv_transfer_params,
             ec_transfer_params,
         });
@@ -313,12 +316,17 @@ pub(crate) async fn structured_chat_event_stream(
             AssistantEvent::Done {
                 usage,
                 finish_reason,
+                spec_decode_metrics,
                 kv_transfer_params,
                 ec_transfer_params,
             } => {
-                for next in
-                    state.finish(usage, finish_reason, kv_transfer_params, ec_transfer_params)?
-                {
+                for next in state.finish(
+                    usage,
+                    finish_reason,
+                    spec_decode_metrics,
+                    kv_transfer_params,
+                    ec_transfer_params,
+                )? {
                     y.yield_ok(next).await;
                 }
             }
@@ -354,6 +362,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -409,6 +418,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -462,6 +472,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -515,6 +526,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -583,6 +595,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),
@@ -634,6 +647,7 @@ mod tests {
                     reasoning_tokens: 3,
                 },
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }),

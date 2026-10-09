@@ -5,6 +5,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_llm::TokenUsage;
 use vllm_text::{DecodedLogprobs, DecodedPromptLogprobs};
 
@@ -236,6 +237,10 @@ pub enum ChatEvent {
         message: AssistantMessage,
         usage: ChatTokenUsage,
         finish_reason: FinishReason,
+        /// Per-request speculative-decoding acceptance metrics reported by the
+        /// engine, when the request ran speculative decoding. Boxed to keep the
+        /// enum variants close in size.
+        spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
         /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
         /// Connector-specific encoder cache transfer parameters for

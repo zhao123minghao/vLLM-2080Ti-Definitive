@@ -13,7 +13,7 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use super::utility::UtilityOutput;
 use crate::error::{Error, Result, ext_value_decode};
 use crate::protocol::logprobs::MaybeWireLogprobs;
-use crate::protocol::stats::{PrefillStats, SchedulerStats};
+use crate::protocol::stats::{PrefillStats, SchedulerStats, SpecDecodeMetrics};
 use crate::protocol::{OpaqueValue, decode_msgpack};
 
 /// The stop reason associated with a finished output.
@@ -127,10 +127,9 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub new_sampling_mask: Option<OpaqueValue>,
     /// Per-request speculative-decoding acceptance metrics, set on the final
-    /// output when `--per-request-spec-decode-metrics` is enabled. Opaque here;
-    /// the Rust frontend does not yet surface it in responses.
+    /// output when `--per-request-spec-decode-metrics` is enabled.
     #[serde(default)]
-    pub spec_decode_metrics: Option<OpaqueValue>,
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
 }
 
 impl EngineCoreOutput {
@@ -375,6 +374,81 @@ mod tests {
     use super::*;
     use crate::protocol::output::EngineCoreOutput;
     use crate::protocol::{decode_msgpack, encode_msgpack};
+
+    /// Reference values measured from the Python engine on an MTP request, at
+    /// the `detailed` level.
+    fn detailed_spec_decode_metrics() -> SpecDecodeMetrics {
+        SpecDecodeMetrics {
+            num_spec_tokens: 4,
+            histogram: vec![0, 2, 0, 2, 1],
+            num_draft_tokens: 20,
+            per_step_accepted: vec![1, 3, 1, 4, 3],
+            per_step_drafted: vec![4, 4, 4, 4, 4],
+        }
+    }
+
+    #[test]
+    fn spec_decode_metrics_use_python_field_names() {
+        let metrics = detailed_spec_decode_metrics();
+        let encoded = encode_msgpack(&metrics).unwrap();
+        let value: rmpv::Value = decode_msgpack(&encoded).unwrap();
+
+        // The Python engine encodes `RequestSpecDecodeMetrics` as a
+        // (non-array-like) dataclass, i.e. a msgpack map keyed by field name.
+        let map = value.as_map().expect("spec metrics must encode as a map");
+        let keys: Vec<&str> = map
+            .iter()
+            .map(|(key, _)| key.as_str().expect("spec metric keys are strings"))
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "num_spec_tokens",
+                "histogram",
+                "num_draft_tokens",
+                "per_step_accepted",
+                "per_step_drafted",
+            ]
+        );
+
+        let decoded: SpecDecodeMetrics = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, metrics);
+    }
+
+    #[test]
+    fn engine_core_outputs_roundtrip_spec_decode_metrics() {
+        let outputs = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![42],
+                finish_reason: Some(EngineCoreFinishReason::Length),
+                spec_decode_metrics: Some(detailed_spec_decode_metrics()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let encoded = encode_msgpack(&outputs).unwrap();
+        let decoded: WireEngineCoreOutputs = decode_msgpack(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.outputs[0].spec_decode_metrics,
+            Some(detailed_spec_decode_metrics())
+        );
+        // Absent metrics must stay absent, not default to a zeroed block.
+        let without = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-2".to_string(),
+                new_token_ids: vec![7],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&without).unwrap();
+        let decoded: WireEngineCoreOutputs = decode_msgpack(&encoded).unwrap();
+        assert!(decoded.outputs[0].spec_decode_metrics.is_none());
+    }
 
     #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {

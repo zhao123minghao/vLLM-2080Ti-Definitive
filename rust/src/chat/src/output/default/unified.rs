@@ -298,6 +298,7 @@ pub(crate) async fn unified_event_stream(
                             reasoning_tokens: state.reasoning_tokens,
                         },
                         finish_reason: finished.finish_reason,
+                        spec_decode_metrics: finished.spec_decode_metrics.map(Box::new),
                         kv_transfer_params: finished.kv_transfer_params,
                         ec_transfer_params: finished.ec_transfer_params,
                     })
@@ -436,6 +437,7 @@ mod tests {
             finished: Some(Box::new(vllm_text::output::Finished {
                 usage: vllm_llm::TokenUsage::default(),
                 finish_reason: crate::FinishReason::Stop(None),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             })),
@@ -762,6 +764,7 @@ mod tests {
                 AssistantEvent::Done {
                     usage: done_usage(0),
                     finish_reason: crate::FinishReason::Stop(None),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 },
@@ -802,6 +805,7 @@ mod tests {
                 AssistantEvent::Done {
                     usage: done_usage(5),
                     finish_reason: crate::FinishReason::Stop(None),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 },
@@ -834,6 +838,7 @@ mod tests {
                 AssistantEvent::Done {
                     usage: done_usage(2),
                     finish_reason: crate::FinishReason::Stop(None),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 },
@@ -886,6 +891,7 @@ mod tests {
                 AssistantEvent::Done {
                     usage: done_usage(5),
                     finish_reason: crate::FinishReason::Stop(None),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 },
@@ -931,6 +937,7 @@ mod tests {
                 AssistantEvent::Done {
                     usage: done_usage(0),
                     finish_reason: crate::FinishReason::Stop(None),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 },

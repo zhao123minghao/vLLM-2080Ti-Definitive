@@ -255,6 +255,7 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         let finish_info = vllm_text::Finished {
             usage: collected.usage,
             finish_reason: collected.finish_reason,
+            spec_decode_metrics: collected.spec_decode_metrics,
             kv_transfer_params: collected.kv_transfer_params,
             ec_transfer_params: collected.ec_transfer_params,
         };

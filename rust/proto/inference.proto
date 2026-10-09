@@ -190,6 +190,26 @@ message FinishInfo {
   google.protobuf.Struct kv_transfer_params = 6;
   //uint64 seed = 7;
   google.protobuf.Struct ec_transfer_params = 8;
+  // Per-request speculative-decoding acceptance metrics, present when the
+  // engine computed them for this request.
+  SpecDecodeMetrics spec_decode_metrics = 9;
+}
+
+// Per-request speculative-decoding acceptance metrics, mirroring the engine's
+// `RequestSpecDecodeMetrics`. The histogram is dense, indexed by the number of
+// accepted draft tokens `j` (excluding the always-accepted bonus token).
+message SpecDecodeMetrics {
+  // Configured `num_speculative_tokens` (the max `k`); also the histogram's
+  // upper bound.
+  uint32 num_spec_tokens = 1;
+  // Dense counts indexed by accepted draft tokens `j`.
+  repeated uint64 histogram = 2;
+  // Total proposed draft tokens, after the grammar-invalidated adjustment.
+  uint64 num_draft_tokens = 3;
+  // Ordered accepted-draft count per verify step (`detailed` level only).
+  repeated uint64 per_step_accepted = 4;
+  // Ordered proposed-draft count per verify step (`detailed` level only).
+  repeated uint64 per_step_drafted = 5;
 }
 
 // Info for candidate tokens other than the input/sampled

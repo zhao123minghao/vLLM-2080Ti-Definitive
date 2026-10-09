@@ -803,6 +803,7 @@ fn decoded_completion_stream(
                 finished: Some(Box::new(Finished {
                     usage: Default::default(),
                     finish_reason: FinishReason::stop_eos(),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 })),
@@ -814,6 +815,7 @@ fn decoded_completion_stream(
             let finished = (index == last_index).then(|| Finished {
                 usage: Default::default(),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             });

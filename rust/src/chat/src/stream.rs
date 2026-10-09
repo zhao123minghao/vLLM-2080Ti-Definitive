@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use trait_set::trait_set;
+use vllm_engine_core_client::protocol::stats::SpecDecodeMetrics;
 use vllm_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
 
 use crate::FinishReason;
@@ -23,6 +24,9 @@ pub struct CollectedAssistantMessage {
     pub token_ids: Vec<u32>,
     pub usage: ChatTokenUsage,
     pub finish_reason: FinishReason,
+    /// Per-request speculative-decoding acceptance metrics reported by the
+    /// engine, when the request ran speculative decoding.
+    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
     /// Connector-specific encoder cache transfer parameters for disaggregated
@@ -82,6 +86,7 @@ impl ChatEventStream {
                     message: done,
                     usage,
                     finish_reason,
+                    spec_decode_metrics,
                     kv_transfer_params,
                     ec_transfer_params,
                 } => {
@@ -95,6 +100,7 @@ impl ChatEventStream {
                         token_ids,
                         usage,
                         finish_reason,
+                        spec_decode_metrics: spec_decode_metrics.map(|metrics| *metrics),
                         kv_transfer_params,
                         ec_transfer_params,
                     });
@@ -201,6 +207,7 @@ mod tests {
                         cached_token_count: 0,
                     }),
                     finish_reason: FinishReason::stop_eos(),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
@@ -242,6 +249,7 @@ mod tests {
                     cached_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
+                spec_decode_metrics: None,
                 kv_transfer_params: None,
                 ec_transfer_params: None,
             }

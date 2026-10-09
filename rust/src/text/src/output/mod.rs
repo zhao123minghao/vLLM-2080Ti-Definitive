@@ -30,6 +30,9 @@ pub struct CollectedTextOutput {
     pub token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
     pub usage: vllm_llm::TokenUsage,
+    /// Per-request speculative-decoding acceptance metrics reported by the
+    /// engine, when the request ran speculative decoding.
+    pub spec_decode_metrics: Option<vllm_engine_core_client::protocol::stats::SpecDecodeMetrics>,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
     /// Connector-specific encoder cache transfer parameters for disaggregated
@@ -88,6 +91,7 @@ impl<T: TextOutputStream> T {
                                 token_ids: delta_token_ids,
                                 finish_reason: FinishReason::Error,
                                 usage: vllm_llm::TokenUsage::default(),
+                                spec_decode_metrics: None,
                                 kv_transfer_params: None,
                                 ec_transfer_params: None,
                             })
@@ -97,6 +101,7 @@ impl<T: TextOutputStream> T {
                             let mut collected = collected.unwrap();
                             collected.finish_reason = finished.finish_reason;
                             collected.usage = finished.usage;
+                            collected.spec_decode_metrics = finished.spec_decode_metrics;
                             collected.kv_transfer_params = finished.kv_transfer_params;
                             collected.ec_transfer_params = finished.ec_transfer_params;
                             return Ok(collected);
@@ -171,6 +176,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::stop_eos(),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 })),
@@ -293,6 +299,7 @@ mod tests {
                         cached_token_count: 0,
                     },
                     finish_reason: FinishReason::stop_eos(),
+                    spec_decode_metrics: None,
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 })),

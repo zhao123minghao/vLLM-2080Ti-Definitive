@@ -11,8 +11,9 @@ use vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams;
 use vllm_text::{Prompt, TruncationSide};
 
 use crate::routes::openai::utils::types::{
-    LogProbs, Normalizable, PromptLogprobs, StreamOptions, StreamResponseEnvelope, StringOrArray,
-    Usage, default_true, deserialize_request_top_k, validate_stop,
+    LogProbs, Normalizable, PerRequestMetrics, PromptLogprobs, StreamOptions,
+    StreamResponseEnvelope, StringOrArray, Usage, default_true, deserialize_request_top_k,
+    validate_stop,
 };
 
 /// Serde default for `CompletionRequest::max_tokens`, matching the Python vLLM
@@ -226,6 +227,9 @@ pub(super) struct CompletionResponse {
     pub system_fingerprint: Option<String>,
     pub kv_transfer_params: Option<Value>,
     pub ec_transfer_params: Option<Value>,
+    /// Per-request timing and spec-decode metrics; `null` when the engine
+    /// reported none, mirroring the Python frontend.
+    pub metrics: Option<PerRequestMetrics>,
 }
 
 /// Mirrors the Python vLLM `CompletionResponseChoice` class.
@@ -242,6 +246,9 @@ pub(super) struct CompletionChoice {
 }
 
 /// Mirrors the Python vLLM `CompletionStreamResponse` class.
+///
+/// Metrics ride only on the final usage chunk, and only when usage reporting
+/// is enabled, mirroring the Python frontend.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct CompletionStreamResponse {
@@ -249,6 +256,10 @@ pub(super) struct CompletionStreamResponse {
     pub envelope: Arc<StreamResponseEnvelope>,
     pub choices: Vec<CompletionStreamChoice>,
     pub usage: Option<Usage>,
+    /// Streamed as a value so the `null` timing fields are dropped, matching
+    /// the Python frontend's `exclude_none=True` streaming serialization.
+    #[serde(serialize_with = "crate::routes::openai::utils::types::serialize_stream_metrics")]
+    pub metrics: Option<PerRequestMetrics>,
 }
 
 impl CompletionStreamResponse {
@@ -258,6 +269,7 @@ impl CompletionStreamResponse {
             envelope: Arc::clone(envelope),
             choices: Vec::new(),
             usage: None,
+            metrics: None,
         }
     }
 }
