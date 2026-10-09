@@ -544,9 +544,19 @@ fn apply(
             })
         }
         "pool_init" => {
-            let num_blocks = parse_usize(need(parts, 1, "pool_init <num_blocks> <0|1>")?)?;
-            let enable_caching = parse_bool(need(parts, 2, "pool_init <num_blocks> <0|1>")?)?;
-            match BlockPool::new(num_blocks, enable_caching) {
+            let usage = "pool_init <num_blocks> <0|1 caching> <0|1 events> <0|1 metrics> <medium>";
+            let num_blocks = parse_usize(need(parts, 1, usage)?)?;
+            let enable_caching = parse_bool(need(parts, 2, usage)?)?;
+            let enable_events = parse_bool(need(parts, 3, usage)?)?;
+            let collect_metrics = parse_bool(need(parts, 4, usage)?)?;
+            let medium = need(parts, 5, usage)?;
+            match BlockPool::new(
+                num_blocks,
+                enable_caching,
+                enable_events,
+                collect_metrics,
+                medium,
+            ) {
                 Ok(created) => {
                     *pool = Some(created);
                     Ok(ok())
@@ -554,6 +564,22 @@ fn apply(
                 Err(error) => Ok(err(error)),
             }
         }
+        "pool_take_events" => match pool {
+            Some(pool) => {
+                let medium = pool.medium().to_string();
+                let events = pool.take_events();
+                Ok(if events.is_empty() {
+                    ok()
+                } else {
+                    ok_values(events.iter().map(|event| event.canonical_for_log(&medium)))
+                })
+            }
+            None => Err("pool_take_events before pool_init".to_string()),
+        },
+        "pool_drain_metrics" => match pool {
+            Some(pool) => Ok(ok_value(pool.drain_metric_events().to_string())),
+            None => Err("pool_drain_metrics before pool_init".to_string()),
+        },
         "pool_new" => {
             let num_blocks = parse_usize(need(parts, 1, "pool_new <n>")?)?;
             match pool {
@@ -922,7 +948,7 @@ map_dump -> ok a1:5
     #[test]
     fn replay_drives_the_pool_operations() {
         let trace = "\
-pool_init 4 1
+pool_init 4 1 0 0 GPU
 pool_order
 pool_new 2
 pool_set_hash 1 aa 32
@@ -936,7 +962,7 @@ pool_reset
 pool_dump
 ";
         let expected = "\
-pool_init 4 1 -> ok
+pool_init 4 1 0 0 GPU -> ok
 pool_order -> ok 1 2 3
 pool_new 2 -> ok 1 2
 pool_set_hash 1 aa 32 -> ok
@@ -947,7 +973,7 @@ pool_num_free -> ok 3
 pool_usage -> ok 0.000000
 pool_new 5 -> err ValueError
 pool_reset -> ok 1
-pool_dump -> ok free=3 map=0 watchers=- 0:0:-:-:- 1:0:-:-:- 2:0:-:-:- 3:0:-:-:-
+pool_dump -> ok free=3 map=0 watchers=- events=- metrics=none 0:0:-:-:- 1:0:-:-:- 2:0:-:-:- 3:0:-:-:-
 ";
         assert_eq!(replay(trace).unwrap(), expected);
     }
