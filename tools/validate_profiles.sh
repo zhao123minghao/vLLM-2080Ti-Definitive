@@ -230,7 +230,12 @@ while IFS= read -r -d '' file; do
 done < <(find "$PROFILE_DIR" -type f -name '*.env' -print0 | sort -z)
 
 if [[ "$PROFILE_DIR" == "$ROOT/profiles" ]]; then
-  mapfile -t actual_profiles < <(find "$PROFILE_DIR" -type f -name '*.env' -printf '%P\n' | sort)
+  # `profiles/local` is the user-local scratch area that `update.sh` preserves
+  # across updates, so it is not part of the shipped matrix. Its files are still
+  # syntax- and schema-checked by the loop above; only the official comparison
+  # skips them.
+  mapfile -t actual_profiles < <(find "$PROFILE_DIR" -type f -name '*.env' \
+    -not -path "$PROFILE_DIR/local/*" -printf '%P\n' | sort)
   if (( ${#actual_profiles[@]} != ${#expected_profiles[@]} )); then
     profile_error "<profile-matrix>" "expected exactly ${#expected_profiles[@]} official profiles, found ${#actual_profiles[@]}"
   else
