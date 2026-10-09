@@ -305,7 +305,12 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
+                profile_start = time.time()
                 available_gpu_memory = self.model_executor.determine_available_memory()
+                logger.info(
+                    "startup: available-memory profile run took %.2f s",
+                    time.time() - profile_start,
+                )
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
@@ -316,6 +321,9 @@ class EngineCore:
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
+        # Startup diagnostics for this fork (see docs/startup-timeline.md): the config work and
+        # the KV cache allocation used to be the silent part of engine startup.
+        specs_done = time.time()
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
@@ -352,6 +360,12 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         self.model_executor.initialize_from_config(kv_cache_configs)
+        logger.info(
+            "startup: kv cache phase timings: specs %.2f s (incl. memory profile), "
+            "config+allocation %.2f s",
+            specs_done - start,
+            time.time() - specs_done,
+        )
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
 

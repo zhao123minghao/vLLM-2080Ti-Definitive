@@ -4,6 +4,32 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ## Unreleased
 
+### Startup instrumentation: where the 51 s actually go
+
+The timeline report showed that most of startup was silence, so the silent parts are now
+instrumented (log-only, no behaviour change):
+
+- `vllm/v1/executor/multiproc_executor.py` logs one `startup:` line per worker — spawn, entry
+  into `worker_main`, `init_worker` (model module import), `init_device`, `load_model` and ready
+  — each relative to the instant the parent forked it, plus the total the parent waited. The
+  parent's `time.monotonic()` is passed into the child; `CLOCK_MONOTONIC` is system-wide on
+  Linux, which is what makes the comparison valid.
+- `vllm/v1/engine/core.py` logs the available-memory profile run and the KV cache config plus
+  allocation separately.
+- `tools/startup_timeline.py` grew a section that prints those markers in order, so the
+  decomposition needs no manual log reading.
+
+Measured on the reference route (launcher total 51 s): ~17 s before the engine core exists
+(9 s frontend and interpreter, 8 s Python imports and engine construction); 24 s of engine core
+init; ~8 s of memory profile, config and warmup; ~2 s of health check and handshake. The
+biggest single finding is that **the workers come up one after another**: rank 0 entered
+`worker_main` 0.3 s after being forked, rank 1 took 7.0 s, and rank 1 was forked 6.7 s after
+rank 0 — while rank 0 was already running the CUDA/distributed init and loading weights. That
+is contention rather than a fixed fork cost, and the levers (bring all workers up before heavy
+per-worker init, or avoid copying the parent's page tables via
+`VLLM_WORKER_MULTIPROC_METHOD`) are named in the document rather than guessed at. KV cache
+*allocation* turns out to be 0.03 s; the 5.75 s next to it is the memory profile run.
+
 ### Startup timeline
 
 "Startup takes ~53 s" was measured but never explained; the launcher run log already holds both

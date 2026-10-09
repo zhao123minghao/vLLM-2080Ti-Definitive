@@ -196,6 +196,17 @@ def main() -> int:
             suffix = f"  (x{count})" if count > 1 else ""
             print(f"  +{entry.offset:6.0f}s  {seconds:7.2f}s  {label}{suffix}")
 
+    print("\nstartup markers logged by the engine (`startup:` lines):")
+    markers = [entry for entry in entries if entry.message.lstrip("[").split("] ")[-1].startswith("startup:")]
+    if not markers:
+        print("  none (this log predates the startup instrumentation, or the run is not a fork run)")
+    previous = None
+    for entry in markers:
+        text = entry.message.split("startup:", 1)[1].strip()
+        delta = "" if previous is None else f"  (+{entry.offset - previous:.2f}s)"
+        print(f"  +{entry.offset:6.2f}s  {text}{delta}")
+        previous = entry.offset
+
     print("\nmilestones (first line seen):")
     previous_offset = 0.0
     reached = 0

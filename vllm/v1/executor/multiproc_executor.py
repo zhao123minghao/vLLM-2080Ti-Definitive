@@ -72,6 +72,12 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
+# Startup diagnostics for this fork (see docs/startup-timeline.md). The run log used to fall
+# silent for the whole worker bring-up; every `startup:` line is logged relative to this
+# instant, and `time.monotonic()` is CLOCK_MONOTONIC on Linux, which the worker processes can
+# compare against their own clock.
+_EXECUTOR_MODULE_IMPORT = time.monotonic()
+
 
 class FutureWrapper(Future):
     def __init__(
@@ -644,8 +650,10 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        spawn_monotonic: float | None = None,
     ):
         self.rank = rank
+        self._spawn_monotonic = spawn_monotonic
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -662,12 +670,15 @@ class WorkerProc:
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
 
+        self._log_startup("init_worker (model module import)")
+
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
 
         # Load model
         self.worker.init_device()
+        self._log_startup("init_device")
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -676,6 +687,7 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
+        self._log_startup("load_model")
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
@@ -728,6 +740,8 @@ class WorkerProc:
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
+            # Startup diagnostics: the child reports its boot relative to this instant.
+            "spawn_monotonic": time.monotonic(),
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
@@ -744,6 +758,16 @@ class WorkerProc:
             vllm_config, local_rank, process_kind="worker"
         ):
             proc.start()
+
+        # Startup diagnostics for this fork: the run log used to fall silent from here until
+        # the worker's first log line, which hid the per-rank import cost (see
+        # docs/startup-timeline.md). CLOCK_MONOTONIC is system-wide on Linux, so the child can
+        # subtract this timestamp from its own clock and report its boot per phase.
+        logger.info(
+            "startup: worker rank=%d spawned at +%.2f s since executor import",
+            rank,
+            time.monotonic() - _EXECUTOR_MODULE_IMPORT,
+        )
 
         # Close child ends of pipes here in the parent
         ready_writer.close()
@@ -782,6 +806,7 @@ class WorkerProc:
             "background process. See stack trace for root cause."
         )
 
+        wait_start = time.monotonic()
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
@@ -797,6 +822,16 @@ class WorkerProc:
                     if response["status"] != "READY":
                         raise e
 
+                    # Startup diagnostics: one line per worker, so a rank that boots late is
+                    # visible instead of averaged into a total.
+                    logger.info(
+                        "startup: worker rank=%d ready at +%.2f s since executor import "
+                        "(%.2f s since the first spawn)",
+                        unready_proc_handle.rank,
+                        time.monotonic() - _EXECUTOR_MODULE_IMPORT,
+                        time.monotonic() - wait_start,
+                    )
+
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
@@ -809,6 +844,11 @@ class WorkerProc:
                     # Close connection.
                     pipe.close()
 
+        logger.info(
+            "startup: all %d worker(s) ready took %.2f s",
+            len(ready_proc_handles),
+            time.monotonic() - wait_start,
+        )
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
@@ -847,10 +887,32 @@ class WorkerProc:
             name="DeathPipeMonitor",
         ).start()
 
+    def _log_startup(self, phase: str) -> None:
+        """Log a worker boot phase relative to the moment the parent spawned this process."""
+        if self._spawn_monotonic is None:
+            return
+        logger.info(
+            "startup: worker rank=%d %s done at +%.2f s since spawn",
+            self.rank,
+            phase,
+            time.monotonic() - self._spawn_monotonic,
+        )
+
     @staticmethod
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+
+        # Startup diagnostics: the parent records when it spawned this process, and
+        # CLOCK_MONOTONIC is comparable across processes on Linux, so the cost of getting here
+        # (interpreter start plus this module's imports) is measurable.
+        spawn_monotonic = kwargs.pop("spawn_monotonic", None)
+        if spawn_monotonic is not None:
+            logger.info(
+                "startup: worker rank=%s entered worker_main at +%.2f s since spawn",
+                kwargs.get("rank", 0),
+                time.monotonic() - spawn_monotonic,
+            )
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -906,7 +968,7 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
-            worker = WorkerProc(*args, **kwargs)
+            worker = WorkerProc(*args, spawn_monotonic=spawn_monotonic, **kwargs)
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
                 numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
