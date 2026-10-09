@@ -14,7 +14,7 @@ import vllm.envs as envs
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.multimodal.audio import resample_audio_pyav
-from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.import_utils import LazyModule, PlaceholderModule
 from vllm.utils.mem_constants import MiB_bytes
 from vllm.utils.serial_utils import tensor2base64
 from vllm.utils.sparse_utils import (
@@ -26,15 +26,9 @@ from .base import MediaIO
 
 logger = init_logger(__name__)
 
-try:
-    import av
-except ImportError:
-    av = PlaceholderModule("av")  # type: ignore[assignment]
-
-try:
-    import soundfile
-except ImportError:
-    soundfile = PlaceholderModule("soundfile")  # type: ignore[assignment]
+# Deferred: the audio decoding libraries are only needed once media is loaded.
+av = LazyModule("av")
+soundfile = LazyModule("soundfile")
 
 try:
     from torchcodec.decoders import AudioDecoder

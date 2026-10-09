@@ -3,6 +3,7 @@
 import logging
 import os
 import traceback
+from functools import lru_cache
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,7 @@ def tpu_platform_plugin() -> str | None:
         return None
 
 
+@lru_cache(maxsize=1)
 def cuda_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA platform is available.")
@@ -70,11 +72,12 @@ def cuda_platform_plugin() -> str | None:
             # we need to check if vllm is built with cpu too.
             # Otherwise, vllm will always activate cuda plugin
             # on a GPU machine, even if in a cpu build.
+            device_count = pynvml.nvmlDeviceGetCount()
             is_cuda = (
-                pynvml.nvmlDeviceGetCount() > 0
+                device_count > 0
                 and not vllm_version_matches_substr("cpu")
             )
-            if pynvml.nvmlDeviceGetCount() <= 0:
+            if device_count <= 0:
                 logger.debug("CUDA platform is not available because no GPU is found.")
             if vllm_version_matches_substr("cpu"):
                 logger.debug(
@@ -82,8 +85,10 @@ def cuda_platform_plugin() -> str | None:
                 )
             if is_cuda:
                 logger.debug("Confirmed CUDA platform is available.")
-        finally:
-            pynvml.nvmlShutdown()
+        except Exception:
+            # Leave the NVML session up: it is initialized for the lifetime of
+            # the process (see `vllm.platforms.cuda`).
+            raise
     except Exception as e:
         logger.debug("Exception happens when checking CUDA platform: %s", str(e))
         if "nvml" not in e.__class__.__name__.lower():

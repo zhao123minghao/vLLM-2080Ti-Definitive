@@ -201,14 +201,24 @@ class _BackendCandidate(NamedTuple):
     priority: int
 
 
+@lru_cache(maxsize=1)
+def _ensure_nvml_initialized() -> None:
+    """Initialize NVML once for the lifetime of the process.
+
+    The first `nvmlInit()` loads libnvidia-ml and costs about a second, while
+    the `nvmlShutdown()`/`nvmlInit()` cycles that followed each decorated call
+    made import-time platform resolution pay that cost repeatedly. NVML is
+    designed to be initialized once and left up, so the session is kept for the
+    whole process instead of being torn down per call.
+    """
+    pynvml.nvmlInit()
+
+
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        pynvml.nvmlInit()
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            pynvml.nvmlShutdown()
+        _ensure_nvml_initialized()
+        return fn(*args, **kwargs)
 
     return wrapper
 

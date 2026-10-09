@@ -17,13 +17,12 @@ from vllm.multimodal.video_decoders import (
     decode_video,
     resolve_video_backend_kwargs,
 )
-from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.import_utils import LazyModule
 from vllm.utils.registry import ExtensionManager
 
-try:
-    import cv2
-except ImportError:
-    cv2 = PlaceholderModule("cv2")
+# OpenCV is only needed to decode video, so it is imported on first attribute access:
+# it is a large dependency that text-only routes never touch.
+cv2 = LazyModule("cv2")
 
 
 logger = init_logger(__name__)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -61,10 +62,37 @@ class HummingMoEQuantConfig(FusedMoEQuantConfig):
     w2_humming_config: "LayerConfig"
 
 
-if has_humming():
+class _LazyDtypeMap(dict):
+    """A dtype map that imports `humming` on its first lookup.
+
+    The maps used to be built at import time, which pulled the `humming` package and
+    its native kernels into every process, including routes that never select a
+    humming quantization method.
+    """
+
+    def __init__(self, build: Callable[[], dict]) -> None:
+        super().__init__()
+        self._build = build
+        self._built = False
+
+    def _ensure(self) -> None:
+        if not self._built:
+            super().update(self._build())
+            self._built = True
+
+    def __getitem__(self, key: Any) -> Any:
+        self._ensure()
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self._ensure()
+        return super().get(key, default)
+
+
+def _build_humming_to_quant_dtype() -> dict[Any, Any]:
     from vllm.utils.humming import dtypes as humming_dtypes
 
-    _HUMMING_TO_QUANT_DTYPE: dict[humming_dtypes.DataType, Any] = {
+    return {
         humming_dtypes.float4e2m1: FP4_DTYPE,
         humming_dtypes.float8e4m3: FP8_DTYPE,
         humming_dtypes.float8e5m2: torch.float8_e5m2,
@@ -78,13 +106,21 @@ if has_humming():
         humming_dtypes.uint7: torch.uint8,
     }
 
-    _HUMMING_TO_SCALE_DTYPE: dict[humming_dtypes.DataType, torch.dtype] = {
+
+def _build_humming_to_scale_dtype() -> dict[Any, Any]:
+    from vllm.utils.humming import dtypes as humming_dtypes
+
+    return {
         humming_dtypes.float8e8m0: MXFP_SCALE_DTYPE,
         humming_dtypes.float8e4m3: FP8_DTYPE,
         humming_dtypes.float16: torch.float16,
         humming_dtypes.bfloat16: torch.bfloat16,
         humming_dtypes.float32: torch.float32,
     }
+
+
+_HUMMING_TO_QUANT_DTYPE: dict[Any, Any] = _LazyDtypeMap(_build_humming_to_quant_dtype)
+_HUMMING_TO_SCALE_DTYPE: dict[Any, Any] = _LazyDtypeMap(_build_humming_to_scale_dtype)
 
 
 def _group_shape(group_size: int, group_size_n: int = 0) -> GroupShape:

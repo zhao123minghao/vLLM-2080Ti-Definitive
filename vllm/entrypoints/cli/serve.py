@@ -9,14 +9,11 @@ import uvloop
 
 import vllm
 import vllm.envs as envs
-from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.api_server.entry import run_server, setup_server
+from vllm.entrypoints.cli.types import CLISubcommand, VLLM_SUBCMD_PARSER_EPILOG
 from vllm.entrypoints.launchers.cli_args import (
     make_arg_parser,
     validate_parsed_serve_args,
 )
-from vllm.entrypoints.launchers.dp_supervisor import run_dp_supervisor
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -24,7 +21,6 @@ from vllm.utils.network_utils import get_tcp_uri
 from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
 from vllm.v1.executor import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 from vllm.v1.utils import (
     APIServerProcessManager,
     RustFrontendProcessManager,
@@ -142,13 +138,18 @@ class ServeSubcommand(CLISubcommand):
             args.api_server_count = 1
 
         if is_multi_port:
+            from vllm.entrypoints.launchers.dp_supervisor import run_dp_supervisor
+
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
         elif args.api_server_count > 1 or rust_frontend_path:
             run_multi_api_server(args)
         else:
-            # Single API server (this process).
+            # Single API server (this process). Imported here so that the
+            # headless engine path does not pull the FastAPI serving stack.
+            from vllm.entrypoints.launchers.api_server.entry import run_server
+
             args.api_server_count = None
             uvloop.run(run_server(args))
 
@@ -261,6 +262,10 @@ def run_headless(args: argparse.Namespace):
 
 def run_multi_api_server(args: argparse.Namespace):
     assert not args.headless
+    # Imported here so that the headless engine path does not pull the FastAPI
+    # serving stack.
+    from vllm.entrypoints.launchers.api_server.entry import setup_server
+
     rust_frontend_path = (
         envs.VLLM_RUST_FRONTEND_PATH if envs.VLLM_USE_RUST_FRONTEND else None
     )
@@ -273,6 +278,8 @@ def run_multi_api_server(args: argparse.Namespace):
         )
 
     if num_api_servers > 1:
+        from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
+
         setup_multiprocess_prometheus()
 
     shutdown_requested = False
@@ -289,7 +296,6 @@ def run_multi_api_server(args: argparse.Namespace):
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=num_api_servers > 1)
-
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
     engine_args._api_process_count = num_api_servers
     engine_args._api_process_rank = -1

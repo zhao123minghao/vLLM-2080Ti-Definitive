@@ -5,6 +5,7 @@
 Note that all future modules must be lazily loaded within main
 to avoid certain eager import breakage."""
 
+import importlib
 import importlib.metadata
 import sys
 from importlib.util import find_spec
@@ -12,6 +13,30 @@ from importlib.util import find_spec
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# All subcommand modules, in the order they are registered for help output.
+_SUBCOMMAND_MODULES = (
+    "vllm.entrypoints.cli.benchmark.main",
+    "vllm.entrypoints.cli.collect_env",
+    "vllm.entrypoints.cli.launch",
+    "vllm.entrypoints.cli.openai",
+    "vllm.entrypoints.cli.run_batch",
+    "vllm.entrypoints.cli.serve",
+)
+
+# Subcommand name -> the single module that provides it. Importing only that
+# module keeps unrelated commands (and their heavy serving imports) out of the
+# process; the headless engine path only ever imports `serve`.
+_SUBCOMMAND_PROVIDER = {
+    "serve": "vllm.entrypoints.cli.serve",
+    "bench": "vllm.entrypoints.cli.benchmark.main",
+    "launch": "vllm.entrypoints.cli.launch",
+    "render": "vllm.entrypoints.cli.launch",
+    "collect-env": "vllm.entrypoints.cli.collect_env",
+    "run-batch": "vllm.entrypoints.cli.run_batch",
+    "chat": "vllm.entrypoints.cli.openai",
+    "complete": "vllm.entrypoints.cli.openai",
+}
 
 
 def maybe_run_omni() -> bool:
@@ -36,34 +61,41 @@ def maybe_run_omni() -> bool:
     return True
 
 
+def _subcommand_provider() -> str | None:
+    """Return the module providing the requested subcommand, if identifiable.
+
+    `None` means "unknown or not requested", in which case every subcommand
+    module is imported so that help output and argument validation stay
+    complete.
+    """
+    for arg in sys.argv[1:]:
+        if arg.startswith("-"):
+            continue
+        return _SUBCOMMAND_PROVIDER.get(arg)
+    return None
+
+
 def main():
     if maybe_run_omni():
         return
 
-    import vllm.entrypoints.cli.benchmark.main
-    import vllm.entrypoints.cli.collect_env
-    import vllm.entrypoints.cli.launch
-    import vllm.entrypoints.cli.openai
-    import vllm.entrypoints.cli.run_batch
-    import vllm.entrypoints.cli.serve
-    from vllm.entrypoints.serve.utils.api_utils import (
+    from vllm.entrypoints.cli.types import (
         VLLM_SUBCMD_PARSER_EPILOG,
         cli_env_setup,
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    CMD_MODULES = [
-        vllm.entrypoints.cli.openai,
-        vllm.entrypoints.cli.serve,
-        vllm.entrypoints.cli.launch,
-        vllm.entrypoints.cli.benchmark.main,
-        vllm.entrypoints.cli.collect_env,
-        vllm.entrypoints.cli.run_batch,
-    ]
+    provider = _subcommand_provider()
+    if provider is None:
+        cmd_modules = [importlib.import_module(name) for name in _SUBCOMMAND_MODULES]
+    else:
+        cmd_modules = [importlib.import_module(provider)]
 
     cli_env_setup()
 
-    vllm.entrypoints.cli.benchmark.main.maybe_exec_rust_bench()
+    benchmark_main = sys.modules.get("vllm.entrypoints.cli.benchmark.main")
+    if benchmark_main is not None:
+        benchmark_main.maybe_exec_rust_bench()
 
     # For 'vllm bench *': use CPU instead of UnspecifiedPlatform by default
     if len(sys.argv) > 1 and sys.argv[1] == "bench":
@@ -93,7 +125,7 @@ def main():
     )
     subparsers = parser.add_subparsers(required=False, dest="subparser")
     cmds = {}
-    for cmd_module in CMD_MODULES:
+    for cmd_module in cmd_modules:
         new_cmds = cmd_module.cmd_init()
         for cmd in new_cmds:
             cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)

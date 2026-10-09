@@ -303,6 +303,43 @@ class _PlaceholderBase:
         return self.__getattr__("__exit__")
 
 
+class LazyModule:
+    """Import a module on first attribute access.
+
+    Use this for heavy optional dependencies that only some code paths need, so that
+    importing a module which merely references them does not pay the cost. Unlike a
+    plain ``try: import x`` at module scope, nothing is imported until an attribute is
+    read, and a missing module still produces the extra-aware error message from
+    [`PlaceholderModule`][vllm.utils.import_utils.PlaceholderModule].
+    """
+
+    def __init__(self, name: str) -> None:
+        # Underscored (not name mangled) so the guard in __getattr__ can recognise
+        # reads that happen before (or during) initialisation.
+        self._lazy_name = name
+        self._lazy_module: ModuleType | None = None
+
+    def __getattr__(self, item: str) -> Any:
+        if item.startswith("_lazy_"):
+            raise AttributeError(item)
+
+        module = self._lazy_module
+        if module is None:
+            try:
+                module = importlib.import_module(self._lazy_name)
+            except ImportError:
+                # Raise the same hint as PlaceholderModule before giving up.
+                PlaceholderModule(self._lazy_name).__getattr__(item)
+                raise
+            self._lazy_module = module
+        return getattr(module, item)
+
+    def __dir__(self) -> list[str]:
+        if self._lazy_module is None:
+            return [self._lazy_name]
+        return dir(self._lazy_module)
+
+
 class PlaceholderModule(_PlaceholderBase):
     """
     A placeholder object to use when a module does not exist.
@@ -411,16 +448,26 @@ class LazyLoader(ModuleType):
 
 
 # Optional dependency detection utilities
+#
+# These checks must stay cheap: probing them with a trial import pulled hundreds of
+# MB of optional native stack into startup (numba/llvmlite, and humming with its
+# TileLang/TVM chain) for code paths that never ran. A spec check is sufficient
+# because the import site itself reports a real error if the install is broken.
+_SPEC_ONLY_PROBE = frozenset({"numba", "humming", "llguidance", "tilelang"})
+
+
 @cache
 def _has_module(module_name: str) -> bool:
     """Return True if *module_name* can be imported in the current environment.
 
     Uses ``importlib.util.find_spec`` as a fast pre-check, then performs a
-    trial import to verify that native dependencies (shared libraries, etc.)
+trial import to verify that native dependencies (shared libraries, etc.)
     are also satisfied. Any failure during the trial import is treated as the
     module being unavailable. The result is cached so that subsequent queries
     for the same module incur no additional overhead.
     """
+    if module_name in _SPEC_ONLY_PROBE:
+        return _has_module_spec(module_name)
     try:
         if importlib.util.find_spec(module_name) is None:
             return False

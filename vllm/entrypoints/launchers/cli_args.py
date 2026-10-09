@@ -8,6 +8,7 @@ It is kept in a separate file for documentation purposes.
 import argparse
 import json
 import ssl
+import sys
 from collections.abc import Sequence
 from dataclasses import field
 from typing import Any, Literal
@@ -15,18 +16,37 @@ from typing import Any, Literal
 import vllm.envs as envs
 from vllm.config import config
 from vllm.engine.arg_utils import AsyncEngineArgs, optional_type
-from vllm.entrypoints.chat_utils import (
+from vllm.entrypoints.chat_common import (
     ChatTemplateContentFormatOption,
     validate_chat_template,
 )
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
-from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from .utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
+
+
+def _tool_call_parser_metavar() -> str:
+    """Metavar for ``--tool-call-parser``.
+
+    Listing the registered parsers imports the tool-parser registry, which in
+    turn imports the OpenAI SDK. The headless engine process never uses tool
+    parsers (the frontend owns them), so the registry is only consulted when
+    help output is being rendered.
+    """
+    wants_help = any(
+        arg in ("-h", "--help") or arg.startswith("--help=") for arg in sys.argv
+    )
+    if not wants_help:
+        return "name registered in --tool-parser-plugin"
+
+    from vllm.tool_parsers import ToolParserManager
+
+    parsers_str = ",".join(ToolParserManager.list_registered())
+    return f"{{{parsers_str}}} or name registered in --tool-parser-plugin"
 
 
 class LoRAParserAction(argparse.Action):
@@ -213,11 +233,7 @@ class BaseFrontendArgs:
         frontend_kwargs["lora_modules"]["action"] = LoRAParserAction
 
         # Special case: Tool call parser shows built-in options.
-        valid_tool_parsers = list(ToolParserManager.list_registered())
-        parsers_str = ",".join(valid_tool_parsers)
-        frontend_kwargs["tool_call_parser"]["metavar"] = (
-            f"{{{parsers_str}}} or name registered in --tool-parser-plugin"
-        )
+        frontend_kwargs["tool_call_parser"]["metavar"] = _tool_call_parser_metavar()
         return frontend_kwargs
 
     @classmethod

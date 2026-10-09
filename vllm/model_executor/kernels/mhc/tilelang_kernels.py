@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -18,8 +18,13 @@ from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
     make_tilelang_warmup_tensor,
 )
 from vllm.platforms import current_platform
-from vllm.tilelang_utils import T, tilelang, tilelang_jit
+from vllm.tilelang_utils import tilelang_jit
 from vllm.utils.math_utils import cdiv
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime: the kernel bodies resolve `T`/`tilelang` from their
+    # own module globals once the JIT decoration runs (see `tilelang_jit`).
+    from vllm.tilelang_utils import T, tilelang
 
 ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
 

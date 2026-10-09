@@ -10,13 +10,11 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
-from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.import_utils import LazyModule, PlaceholderModule
 from vllm.utils.torch_utils import set_default_torch_num_threads
 
-try:
-    import av as av
-except ImportError:
-    av = PlaceholderModule("av")  # type: ignore[assignment]
+# Deferred: pyav is only needed when audio actually gets resampled.
+av = LazyModule("av")
 
 try:
     import scipy.signal as scipy_signal

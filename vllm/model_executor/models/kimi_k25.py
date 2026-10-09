@@ -66,9 +66,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25Config
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k25 import KimiK25Processor
-from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
-    KimiK25FusedVisionProcessor,
-)
 from vllm.utils.import_utils import is_numba_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -122,7 +119,16 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
         self.hf_config = hf_config = self.get_hf_config()
 
         tokenizer = self.get_tokenizer()
-        processor_cls = KimiK25FusedVisionProcessor if is_numba_available() else None
+        # Imported here on purpose: the fused processor compiles numba kernels while
+        # it is imported, and that dependency is only needed for this vision path.
+        if is_numba_available():
+            from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+                KimiK25FusedVisionProcessor,
+            )
+
+            processor_cls = KimiK25FusedVisionProcessor
+        else:
+            processor_cls = None
         logger.info_once(
             "Using %s image preprocessing for Kimi-K2.5/K2.6 vision chunks.",
             "fused CPU" if processor_cls is not None else "remote HF",

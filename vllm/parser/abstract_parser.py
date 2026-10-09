@@ -11,7 +11,7 @@ from functools import cached_property
 from openai.types.responses import ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
 
-from vllm.entrypoints.chat_utils import (
+from vllm.entrypoints.chat_common import (
     get_tool_call_id_type,
     make_tool_call_id,
 )

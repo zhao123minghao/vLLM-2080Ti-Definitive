@@ -7,7 +7,7 @@ import numpy as np
 import numpy.typing as npt
 
 from vllm.logger import init_logger
-from vllm.utils.import_utils import PlaceholderModule
+from vllm.utils.import_utils import LazyModule
 
 from .base import (
     VideoSourceMetadata,
@@ -15,12 +15,10 @@ from .base import (
     check_frame_pixel_limit,
 )
 
-try:
-    import cv2
-    import cv2.videoio_registry as vr
-except ImportError:
-    cv2 = PlaceholderModule("cv2")
-    vr = PlaceholderModule("cv2").placeholder_attr("videoio_registry")
+# Imported on first use: the OpenCV video backend is optional, and OpenCV is a large
+# dependency that text-only routes never touch.
+cv2 = LazyModule("cv2")
+vr = LazyModule("cv2.videoio_registry")
 
 logger = init_logger(__name__)
 

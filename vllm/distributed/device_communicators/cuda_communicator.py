@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import Any
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -82,13 +84,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
-        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-            FlashInferAllReduce,
-        )
-        from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
-            FlashInferPcieIpcAllReduce,
-        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        # FlashInfer all-reduce is opt-in and disabled on SM75. Importing it
+        # unconditionally dragged flashinfer and its cutlass/cudnn frontends into
+        # every CUDA process, hundreds of MB of optional stack that never runs.
+        FlashInferAllReduce: Any = None
+        FlashInferPcieIpcAllReduce: Any = None
+        if use_flashinfer_allreduce:
+            from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+                FlashInferAllReduce,
+            )
+        if use_flashinfer_pcie_ipc_allreduce:
+            from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
+                FlashInferPcieIpcAllReduce,
+            )
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
         )
@@ -106,8 +115,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
-        self.fi_ar_comm: FlashInferAllReduce | None = None
-        self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
+        # FlashInfer communicators stay None unless the flags above enabled them.
+        self.fi_ar_comm: Any = None
+        self.fi_pcie_ipc_ar_comm: Any = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
 

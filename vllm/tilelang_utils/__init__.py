@@ -11,17 +11,23 @@ from typing import TYPE_CHECKING, Any
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
-if TYPE_CHECKING or current_platform.is_cuda():
-    if not has_tilelang():
-        raise ImportError(
-            "tilelang is required for mhc but is not installed. Install it with "
-            "`pip install tilelang`."
-        )
+if TYPE_CHECKING:
     import tilelang
     import tilelang.language as T
-else:
-    tilelang = None  # type: ignore[assignment]
-    T = None  # type: ignore[assignment]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the `tilelang` / `T` module globals on first access (PEP 562).
+
+    Importing TileLang eagerly made every importer pay for a large optional
+    dependency, including call sites that only register MHC kernels and never run
+    them. TileLang parses a decorated kernel body on its first call, so binding the
+    names lazily is sufficient.
+    """
+    if name in ("tilelang", "T"):
+        _ensure_tilelang_imported()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _ensure_tilelang_imported() -> None:
@@ -61,19 +67,16 @@ def _get_pass_configs() -> dict[Any, Any]:
 
 
 def tilelang_jit(kernel_function: Callable[..., Any]) -> Callable[..., Any]:
-    """Apply `tilelang.jit`, deferring until first call on ROCm.
+    """Apply `tilelang.jit`, deferring the decoration until the first call.
 
-    ROCm defers JIT decoration so importing the caller's module does not
-    require TileLang immediately. CUDA keeps the eager decoration behavior.
+    Deferring keeps importing the caller's module free of TileLang: the dependency is
+    only needed once a kernel actually runs, and vLLM warms these kernels up
+    explicitly at startup, so compilation still happens outside the serving loop.
 
-    The kernel body parsed by TileLang references `T` as an unqualified
-    global, so on the deferred ROCm path this rebinds `T`/`tilelang` in the
-    decorated function's own module globals once they become available.
+    The kernel body parsed by TileLang references `T` as an unqualified global, so
+    this rebinds `T`/`tilelang` in the decorated function's own module globals once
+    they become available.
     """
-    if not current_platform.is_rocm():
-        _ensure_tilelang_imported()
-        return tilelang.jit(pass_configs=_get_pass_configs())(kernel_function)
-
     compiled_kernel: Callable[..., Any] | None = None
 
     @functools.wraps(kernel_function)
