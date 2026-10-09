@@ -6,11 +6,11 @@
 //! [`BlockHashToBlockMap`](crate::BlockHashToBlockMap): reference counts, prefix-cache
 //! bookkeeping per block, the eviction order of freed blocks, and the reset path.
 //!
-//! Out of scope on purpose (see `docs/v1-core-rust-migration.md`): hashing itself
-//! (the trace carries the hashes that Python computed) and `cache_full_blocks` /
-//! `cache_partial_block`, which need a `Request`. Cached entries are therefore installed
-//! through the same private helper Python uses ([`BlockPool::insert_block_hash`] mirrors
-//! `_insert_block_hash`).
+//! The `Request`-based entry points are ported as well ([`BlockPool::cache_full_blocks`] and
+//! [`BlockPool::cache_partial_block`]), taking a [`RequestView`] instead of a `Request`: the
+//! trace carries the hashes a real request would have computed, and the harness models a
+//! text-only request, which is why the extra keys stay empty. Hashing itself is out of scope and
+//! covered by the prefix-hash parity check.
 //!
 //! The KV-cache event queue ([`PoolEvent`], `take_events`) and the deterministic half of
 //! `KVCacheMetricsCollector` ([`Metrics`]) are part of the port.
@@ -19,7 +19,7 @@
 //! per-block hash metadata, the cached-hash map, the pending reuse watchers — is what
 //! [`BlockPool::dump`] prints, which is what the parity harness compares.
 
-use crate::{BlockHashToBlockMap, FreeQueue, PyError};
+use crate::{BlockHashToBlockMap, FreeQueue, HashList, PyError, resolve_block_hashes};
 
 /// Per-block state that Python keeps on `KVCacheBlock`.
 #[derive(Debug, Clone, Default)]
@@ -38,6 +38,8 @@ struct BlockState {
 pub struct BlockPool {
     num_gpu_blocks: usize,
     enable_caching: bool,
+    /// `hash_block_size`: the granularity of a request's block hashes.
+    hash_block_size: i64,
     blocks: Vec<BlockState>,
     queue: FreeQueue,
     map: BlockHashToBlockMap,
@@ -53,12 +55,32 @@ pub struct BlockPool {
     metrics: Option<Metrics>,
 }
 
-/// A `KVCacheEvent` as far as the bookkeeping is concerned. `BlockStored` is emitted only by
-/// the `Request`-based entry points, which this port does not cover yet.
+/// A `KVCacheEvent` as far as the bookkeeping is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolEvent {
     /// `BlockRemoved(block_hashes=[...], medium=..., group_idx=...)`.
     BlockRemoved { hash: Vec<u8>, group_idx: u32 },
+    /// `BlockStored(block_hashes=..., parent_block_hash=..., token_ids=..., block_size=...,
+    /// lora_id=..., medium=..., lora_name=..., extra_keys=..., group_idx=..., session_id=...)`.
+    ///
+    /// `hashes` are the newly cached block hashes (one per cached block in `cache_full_blocks`,
+    /// a single one in `cache_partial_block`) and `token_ids` the token range the event covers.
+    /// The LoRA id/name and the session id are outside the port: the harness models a text-only
+    /// request, so they are `None` on both sides.
+    BlockStored {
+        hashes: Vec<Vec<u8>>,
+        parent: Option<Vec<u8>>,
+        token_ids: Vec<i64>,
+        block_size: i64,
+        group_idx: u32,
+        /// `extra_keys` as far as the port is concerned: the harness models a text-only request,
+        /// so every entry is `None` and the only observable facts are whether Python passed a
+        /// list at all (`cache_full_blocks` passes `extra_keys_list if extra_keys_list else
+        /// None` while `cache_partial_block` always passes a one-element list) and how long it
+        /// was. A real entry is a LoRA name, a multi-modal identifier, a cache salt or a
+        /// prompt-embedding hash; the prefix-hash parity check is what covers those.
+        extra_keys: Option<usize>,
+    },
     /// `AllBlocksCleared()`.
     AllBlocksCleared,
 }
@@ -66,8 +88,8 @@ pub enum PoolEvent {
 impl PoolEvent {
     /// Canonical form used by the parity log.
     ///
-    /// The hash is the block hash half of the key (`get_block_hash` strips the 4-byte group
-    /// id). `take_events` normally rewrites that hash into an integer
+    /// The hash of a `BlockRemoved` is the block hash half of the key (`get_block_hash` strips
+    /// the 4-byte group id). `take_events` normally rewrites those hashes into integers
     /// (`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES`, on by default), which the parity harness
     /// switches off: it compares the pool's own payload, so the bytes are what both sides
     /// print.
@@ -76,9 +98,43 @@ impl PoolEvent {
             PoolEvent::BlockRemoved { hash, group_idx } => {
                 format!("removed:{}:{}:{}", hex_encode(hash), group_idx, medium)
             }
+            PoolEvent::BlockStored {
+                hashes,
+                parent,
+                token_ids,
+                block_size,
+                group_idx,
+                extra_keys,
+            } => format!(
+                "stored:{}:{}:{}:{}:{}:{}:{}",
+                join_or_dash(hashes.iter().map(|hash| hex_encode(hash))),
+                parent.as_deref().map(hex_encode).unwrap_or_else(|| "-".to_string()),
+                join_or_dash(token_ids.iter().map(i64::to_string)),
+                block_size,
+                group_idx,
+                medium,
+                match extra_keys {
+                    None => "-".to_string(),
+                    Some(count) => vec!["~"; *count].join(","),
+                },
+            ),
             PoolEvent::AllBlocksCleared => format!("cleared:{medium}"),
         }
     }
+}
+
+/// The slice of a `Request` the prefix-cache entry points read.
+///
+/// Python reads `request.block_hashes` (hashes at `hash_block_size` granularity), the token ids
+/// the `BlockStored` event carries, and — only to build the extra keys — the multi-modal
+/// features, the LoRA request, the cache salt, the prompt embeddings and the session id. The
+/// harness models a text-only request, so those last five are absent and every extra key comes
+/// out as `None`.
+pub struct RequestView<'a> {
+    /// `request.block_hashes`.
+    pub block_hashes: &'a [Vec<u8>],
+    /// `request.all_token_ids`.
+    pub all_token_ids: &'a [i64],
 }
 
 /// The deterministic half of `KVCacheMetricsCollector`.
@@ -150,12 +206,15 @@ impl Metrics {
 impl BlockPool {
     /// Mirror of `BlockPool(...)`.
     ///
-    /// `hash_block_size` is not modelled: it is only used by the hashing paths, which are out of
-    /// scope here. `collect_metrics` stands in for passing a `KVCacheMetricsCollector` with
-    /// `sample_rate=1.0`, and `medium` is the string the KV-cache events report.
+    /// `hash_block_size` is the granularity of the hashes a request carries; the pool itself
+    /// only needs it in the `Request`-based entry points, where `resolve_block_hashes` converts
+    /// between this granularity and a group's block size. `collect_metrics` stands in for
+    /// passing a `KVCacheMetricsCollector` with `sample_rate=1.0`, and `medium` is the string
+    /// the KV-cache events report.
     pub fn new(
         num_gpu_blocks: usize,
         enable_caching: bool,
+        hash_block_size: i64,
         enable_kv_cache_events: bool,
         collect_metrics: bool,
         medium: &str,
@@ -172,6 +231,7 @@ impl BlockPool {
         Ok(Self {
             num_gpu_blocks,
             enable_caching,
+            hash_block_size,
             blocks,
             queue,
             map: BlockHashToBlockMap::new(),
@@ -373,15 +433,7 @@ impl BlockPool {
         }
         let evicted = self.remove_cached_block_hashes(id);
         let had_entries = !evicted.is_empty();
-        if had_entries && self.enable_kv_cache_events {
-            for key in &evicted {
-                let group_idx = group_id_of(key);
-                self.kv_event_queue.push(PoolEvent::BlockRemoved {
-                    hash: block_hash_of(key),
-                    group_idx,
-                });
-            }
-        }
+        self.emit_block_removed_events(&evicted);
         had_entries
     }
 
@@ -418,6 +470,199 @@ impl BlockPool {
             self.maybe_evict_cached_block(*id);
         }
         Ok(())
+    }
+
+    /// `BlockPool.cache_full_blocks`: cache the full blocks of `request` that are not cached yet.
+    ///
+    /// `blocks` are all of the request's blocks, `num_cached_blocks` is how many of them the
+    /// prefix cache already served, and only `blocks[num_cached_blocks..num_full_blocks]` are
+    /// registered. Null and masked-out blocks are skipped, which is what keeps sliding-window
+    /// groups from polluting the hash map. A block that already has a hash is the
+    /// partial-to-full promotion case: its old entries are dropped (with `BlockRemoved` events)
+    /// before the full-block hash takes over.
+    pub fn cache_full_blocks(
+        &mut self,
+        request: &RequestView<'_>,
+        blocks: &[u64],
+        num_cached_blocks: usize,
+        num_full_blocks: usize,
+        block_size: i64,
+        kv_cache_group_id: u32,
+        block_mask: Option<&[bool]>,
+    ) -> Result<(), PyError> {
+        if num_cached_blocks >= num_full_blocks {
+            return Ok(());
+        }
+        if num_full_blocks > blocks.len() {
+            // Python slices `blocks[...]` (which clamps) but then indexes `blocks[i]` while
+            // building the extra keys, so an over-long range is an IndexError there.
+            return Err(PyError::Index);
+        }
+        let new_full_blocks = &blocks[num_cached_blocks..num_full_blocks];
+        if block_mask.is_some_and(|mask| mask.len() != new_full_blocks.len()) {
+            return Err(PyError::Assert);
+        }
+        let block_hashes = self.resolve_request_hashes(request, block_size)?;
+        // Python slices the resolved hashes as well and indexes that slice per block.
+        let new_block_hashes = block_hashes.get(num_cached_blocks..).unwrap_or_default();
+
+        let mut new_hashes: Vec<Vec<u8>> = Vec::new();
+        for (i, id) in new_full_blocks.iter().enumerate() {
+            let index = *id as usize;
+            if self.blocks[index].is_null || block_mask.is_some_and(|mask| !mask[i]) {
+                continue;
+            }
+            let Some(block_hash) = new_block_hashes.get(i) else {
+                return Err(PyError::Index);
+            };
+            let num_hash_tokens = (num_cached_blocks + i + 1) as i64 * block_size;
+            let key = make_block_hash_with_group_id(block_hash, kv_cache_group_id);
+            if self.blocks[index].hash.is_some() {
+                // The only valid case where a "new full block" already has a hash is
+                // partial->full promotion of the same cache block.
+                let promoted =
+                    self.blocks[index].num_tokens.is_some_and(|tokens| tokens < num_hash_tokens);
+                if !promoted {
+                    return Err(PyError::Assert);
+                }
+                let removed = self.remove_cached_block_hashes(*id);
+                self.emit_block_removed_events(&removed);
+            }
+            self.insert_block_hash(&key, *id, Some(num_hash_tokens))?;
+            new_hashes.push(block_hash.clone());
+        }
+
+        if self.enable_kv_cache_events {
+            let parent = if num_cached_blocks == 0 {
+                None
+            } else {
+                Some(block_hashes.get(num_cached_blocks - 1).ok_or(PyError::Index)?.clone())
+            };
+            // Python builds one extra-key entry per registered block and passes the list, or
+            // `None` when the list is empty.
+            let extra_keys = (!new_hashes.is_empty()).then_some(new_hashes.len());
+            self.kv_event_queue.push(PoolEvent::BlockStored {
+                hashes: new_hashes,
+                parent,
+                token_ids: slice_token_ids(
+                    request.all_token_ids,
+                    num_cached_blocks as i64 * block_size,
+                    num_full_blocks as i64 * block_size,
+                ),
+                block_size,
+                group_idx: kv_cache_group_id,
+                extra_keys,
+            });
+        }
+        Ok(())
+    }
+
+    /// `BlockPool.cache_partial_block`: register a partial prefix-cache entry for a block.
+    ///
+    /// A partial entry makes an existing block reachable from a fine-grained prefix boundary
+    /// inside it. Returns the hash key that was registered, or `None` for a null block — the
+    /// one case that returns before the argument assertions run.
+    pub fn cache_partial_block(
+        &mut self,
+        request: &RequestView<'_>,
+        id: u64,
+        num_tokens: i64,
+        kv_cache_group_id: u32,
+        block_size: i64,
+        replace_existing_hashes: bool,
+    ) -> Result<Option<Vec<u8>>, PyError> {
+        if self.blocks[id as usize].is_null {
+            return Ok(None);
+        }
+        if self.hash_block_size == 0 {
+            return Err(PyError::Zero);
+        }
+        if block_size % self.hash_block_size != 0 {
+            return Err(PyError::Assert);
+        }
+        if !(replace_existing_hashes
+            || (block_size > self.hash_block_size && num_tokens % block_size != 0))
+        {
+            return Err(PyError::Assert);
+        }
+        if num_tokens % self.hash_block_size != 0 {
+            return Err(PyError::Assert);
+        }
+        let num_hash_blocks = num_tokens / self.hash_block_size;
+        if num_hash_blocks <= 0 || num_hash_blocks > request.block_hashes.len() as i64 {
+            return Err(PyError::Assert);
+        }
+        let block_hash = request.block_hashes[(num_hash_blocks - 1) as usize].clone();
+        let key = make_block_hash_with_group_id(&block_hash, kv_cache_group_id);
+        let num_hash_tokens = num_hash_blocks * self.hash_block_size;
+        let mut already_cached = self.blocks[id as usize].hash.as_deref() == Some(key.as_slice())
+            || self.map.contain(&key, id);
+        if replace_existing_hashes {
+            let removed = self.remove_cached_block_hashes(id);
+            self.emit_block_removed_events(&removed);
+            already_cached = false;
+        } else if !already_cached
+            && self.blocks[id as usize].hash.is_some()
+            && self.blocks[id as usize]
+                .num_tokens
+                .is_some_and(|tokens| tokens < num_hash_tokens)
+        {
+            let removed = self.remove_cached_block_hashes(id);
+            self.emit_block_removed_events(&removed);
+        }
+        self.insert_block_hash(&key, id, Some(num_hash_tokens))?;
+        if self.enable_kv_cache_events && !already_cached {
+            let parent = if num_hash_blocks > 1 {
+                Some(request.block_hashes[(num_hash_blocks - 2) as usize].clone())
+            } else {
+                None
+            };
+            let block_start = (num_hash_blocks - 1) * self.hash_block_size;
+            self.kv_event_queue.push(PoolEvent::BlockStored {
+                hashes: vec![block_hash],
+                parent,
+                token_ids: slice_token_ids(request.all_token_ids, block_start, num_tokens),
+                block_size: num_tokens - block_start,
+                group_idx: kv_cache_group_id,
+                extra_keys: Some(1),
+            });
+        }
+        Ok(Some(key))
+    }
+
+    /// `BlockPool._emit_block_removed_events`: one `BlockRemoved` per dropped key.
+    fn emit_block_removed_events(&mut self, keys: &[Vec<u8>]) {
+        if !self.enable_kv_cache_events {
+            return;
+        }
+        for key in keys {
+            self.kv_event_queue.push(PoolEvent::BlockRemoved {
+                hash: block_hash_of(key),
+                group_idx: group_id_of(key),
+            });
+        }
+    }
+
+    /// `resolve_block_hashes(request.block_hashes, hash_block_size, block_size)`.
+    fn resolve_request_hashes(
+        &self,
+        request: &RequestView<'_>,
+        block_size: i64,
+    ) -> Result<Vec<Vec<u8>>, PyError> {
+        // The harness only ever asks for positive block sizes; a zero one would divide by zero
+        // on the Python side as well.
+        if self.hash_block_size <= 0 || block_size <= 0 {
+            return Err(PyError::Zero);
+        }
+        let raw = HashList::Raw(request.block_hashes.to_vec());
+        let resolved = resolve_block_hashes(
+            &raw,
+            self.hash_block_size as usize,
+            block_size as usize,
+            false,
+            None,
+        )?;
+        Ok(resolved.values())
     }
 
     /// `BlockPool.reset_prefix_cache`: only possible when every block but the null block is
@@ -512,6 +757,24 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// `make_block_hash_with_group_id`: the hash bytes with the group id appended big-endian.
+fn make_block_hash_with_group_id(hash: &[u8], group_id: u32) -> Vec<u8> {
+    let mut key = hash.to_vec();
+    key.extend_from_slice(&group_id.to_be_bytes());
+    key
+}
+
+/// `all_token_ids[start:end]` for the non-negative bounds the cache paths use.
+fn slice_token_ids(tokens: &[i64], start: i64, end: i64) -> Vec<i64> {
+    let len = tokens.len() as i64;
+    let start = start.clamp(0, len);
+    let end = end.clamp(0, len);
+    if start >= end {
+        return Vec::new();
+    }
+    tokens[start as usize..end as usize].to_vec()
+}
+
 /// `get_block_hash`: the key without its trailing 4-byte group id.
 fn block_hash_of(key: &[u8]) -> Vec<u8> {
     key[..key.len().saturating_sub(4)].to_vec()
@@ -532,7 +795,22 @@ mod tests {
 
     /// A pool with the defaults the harness uses most of the time.
     fn pool(num_gpu_blocks: usize, enable_caching: bool) -> BlockPool {
-        BlockPool::new(num_gpu_blocks, enable_caching, false, false, "GPU").expect("pool")
+        BlockPool::new(num_gpu_blocks, enable_caching, 32, false, false, "GPU").expect("pool")
+    }
+
+    /// A pool that queues KV-cache events, which the `Request`-based entry points emit.
+    fn eventful_pool(num_gpu_blocks: usize) -> BlockPool {
+        BlockPool::new(num_gpu_blocks, true, 32, true, false, "GPU").expect("pool")
+    }
+
+    /// `(hash, token ids)` for a text-only request of `num_hashes` blocks of 32 tokens.
+    fn request_of(num_hashes: usize) -> (Vec<Vec<u8>>, Vec<i64>) {
+        (
+            (0..num_hashes)
+                .map(|index| vec![0x40 + index as u8, 0x11, 0x22, 0x33])
+                .collect(),
+            (0..num_hashes as i64 * 32).collect(),
+        )
     }
 
     #[test]
@@ -641,7 +919,7 @@ mod tests {
     #[test]
     fn eviction_and_reset_queue_their_events() {
         // Key layout as vLLM builds it: block hash plus a 4-byte big-endian group id.
-        let mut pool = BlockPool::new(4, true, true, false, "GPU").unwrap();
+        let mut pool = BlockPool::new(4, true, 32, true, false, "GPU").unwrap();
         let blocks = pool.get_new_blocks(1).unwrap();
         let key = [0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00, 0x00, 0x03];
         pool.insert_block_hash(&key, blocks[0], Some(32)).unwrap();
@@ -683,7 +961,7 @@ mod tests {
 
     #[test]
     fn metrics_track_allocations_accesses_and_evictions() {
-        let mut pool = BlockPool::new(4, true, false, true, "GPU").unwrap();
+        let mut pool = BlockPool::new(4, true, 32, false, true, "GPU").unwrap();
         let blocks = pool.get_new_blocks(1).unwrap();
         let id = blocks[0];
         assert!(
@@ -710,5 +988,163 @@ mod tests {
         pool.get_new_blocks(3).unwrap();
         assert_eq!(pool.drain_metric_events(), 1);
         assert_eq!(pool.drain_metric_events(), 0);
+    }
+
+    #[test]
+    fn cache_full_blocks_caches_the_blocks_after_the_cached_prefix() {
+        let mut pool = eventful_pool(4);
+        let blocks = pool.get_new_blocks(2).unwrap();
+        let (hashes, tokens) = request_of(2);
+        let request = RequestView {
+            block_hashes: &hashes,
+            all_token_ids: &tokens,
+        };
+        pool.cache_full_blocks(&request, &blocks, 0, 2, 32, 1, None).unwrap();
+
+        // Both blocks own their hash and the token count as of that block, so a second
+        // request that covers the same prefix can hit them.
+        assert_eq!(
+            pool.get_cached_block(&make_block_hash_with_group_id(&hashes[0], 1)),
+            Some(blocks[0])
+        );
+        assert_eq!(
+            pool.get_cached_block(&make_block_hash_with_group_id(&hashes[1], 1)),
+            Some(blocks[1])
+        );
+        assert!(pool.dump().contains("1:1:4011223300000001:32:-"));
+
+        // One event for the whole call: both hashes, no parent, the token range of the cached
+        // blocks, and one (empty) extra-key entry per block.
+        let events = pool.take_events();
+        assert_eq!(events.len(), 1);
+        let expected = format!(
+            "stored:40112233,41112233:-:{}:32:1:GPU:~,~",
+            (0..64).map(|token| token.to_string()).collect::<Vec<_>>().join(",")
+        );
+        assert_eq!(events[0].canonical_for_log("GPU"), expected);
+    }
+
+    #[test]
+    fn cache_full_blocks_skips_null_and_masked_blocks() {
+        let mut pool = eventful_pool(4);
+        let blocks = pool.get_new_blocks(2).unwrap();
+        let (hashes, tokens) = request_of(2);
+        let request = RequestView {
+            block_hashes: &hashes,
+            all_token_ids: &tokens,
+        };
+        // The null block is passed in the same slot the first hash belongs to: the hash is not
+        // cached, and the event covers one hash only.
+        pool.cache_full_blocks(&request, &[0, blocks[1]], 0, 2, 32, 2, None).unwrap();
+        assert_eq!(
+            pool.get_cached_block(&make_block_hash_with_group_id(&hashes[0], 2)),
+            None
+        );
+        assert_eq!(
+            pool.get_cached_block(&make_block_hash_with_group_id(&hashes[1], 2)),
+            Some(blocks[1])
+        );
+        let events = pool.take_events();
+        assert!(events[0].canonical_for_log("GPU").starts_with("stored:41112233:-:"));
+        assert!(events[0].canonical_for_log("GPU").ends_with(":2:GPU:~"));
+
+        // A mask that drops every block leaves the cache alone and passes `None` extra keys.
+        let masked = pool.cache_full_blocks(&request, &blocks, 0, 2, 32, 3, Some(&[false, false]));
+        assert_eq!(masked, Ok(()));
+        let events = pool.take_events();
+        assert_eq!(events.len(), 1);
+        let token = events[0].canonical_for_log("GPU");
+        assert!(token.starts_with("stored:-:-:"), "token was {token}");
+        assert!(token.ends_with(":32:3:GPU:-"), "token was {token}");
+
+        // An over-long range is an IndexError, the way Python's `blocks[i]` lookup is.
+        assert_eq!(
+            pool.cache_full_blocks(&request, &blocks, 0, 3, 32, 3, None),
+            Err(PyError::Index)
+        );
+    }
+
+    #[test]
+    fn cache_partial_block_registers_inside_a_block_and_promotes() {
+        let mut pool = eventful_pool(4);
+        let blocks = pool.get_new_blocks(1).unwrap();
+        let (hashes, tokens) = request_of(4);
+        let request = RequestView {
+            block_hashes: &hashes,
+            all_token_ids: &tokens,
+        };
+        // A fine-grained entry at 32 tokens: the block has no hash yet, so it becomes primary.
+        let key = pool.cache_partial_block(&request, blocks[0], 32, 0, 64, false).unwrap();
+        assert_eq!(key, Some(make_block_hash_with_group_id(&hashes[0], 0)));
+        assert!(pool.dump().contains("1:1:4011223300000000:32:-"));
+        let events = pool.take_events();
+        assert!(events[0].canonical_for_log("GPU").ends_with(":32:0:GPU:~"));
+
+        // A deeper entry (96 tokens) promotes the block: the old key is removed with a
+        // BlockRemoved event and the new one takes over as the primary hash.
+        let key = pool.cache_partial_block(&request, blocks[0], 96, 0, 64, false).unwrap();
+        assert_eq!(key, Some(make_block_hash_with_group_id(&hashes[2], 0)));
+        let events = pool.take_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].canonical_for_log("GPU"), "removed:40112233:0:GPU");
+        let stored = events[1].canonical_for_log("GPU");
+        assert!(
+            stored.starts_with("stored:42112233:41112233:"),
+            "stored was {stored}"
+        );
+        assert!(stored.ends_with(":32:0:GPU:~"), "stored was {stored}");
+        assert_eq!(
+            pool.get_cached_block(&make_block_hash_with_group_id(&hashes[0], 0)),
+            None
+        );
+
+        // Replacing the existing hashes drops them first, and a null block is never registered.
+        let (hashes, tokens) = request_of(2);
+        let request = RequestView {
+            block_hashes: &hashes,
+            all_token_ids: &tokens,
+        };
+        assert_eq!(
+            pool.cache_partial_block(&request, 0, 32, 0, 64, false),
+            Ok(None)
+        );
+        assert_eq!(
+            pool.cache_partial_block(&request, blocks[0], 32, 0, 64, true),
+            Ok(Some(make_block_hash_with_group_id(&hashes[0], 0)))
+        );
+        let events = pool.take_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].canonical_for_log("GPU"), "removed:42112233:0:GPU");
+    }
+
+    #[test]
+    fn cache_entry_points_reject_the_same_arguments_as_python() {
+        let mut pool = eventful_pool(4);
+        let blocks = pool.get_new_blocks(1).unwrap();
+        let (hashes, tokens) = request_of(1);
+        let request = RequestView {
+            block_hashes: &hashes,
+            all_token_ids: &tokens,
+        };
+        // The partial entry has to sit inside an owning block: aligned to it, the call is
+        // rejected unless the existing hashes are replaced.
+        assert_eq!(
+            pool.cache_partial_block(&request, blocks[0], 32, 0, 32, false),
+            Err(PyError::Assert)
+        );
+        assert_eq!(
+            pool.cache_partial_block(&request, blocks[0], 64, 0, 64, false),
+            Err(PyError::Assert)
+        );
+        // Beyond the request's own hashes there is no prefix boundary to point at.
+        assert_eq!(
+            pool.cache_partial_block(&request, blocks[0], 64, 0, 64, true),
+            Err(PyError::Assert)
+        );
+        // A block size that is not a multiple of the hash granularity is rejected.
+        assert_eq!(
+            pool.cache_partial_block(&request, blocks[0], 32, 0, 48, false),
+            Err(PyError::Assert)
+        );
     }
 }

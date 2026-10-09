@@ -34,6 +34,7 @@ pub mod pool;
 
 pub use hashes::{BlockHashListView, HashList, format_hashes, resolve_block_hashes};
 pub use pool::BlockPool;
+use pool::RequestView;
 
 /// The Python exception a rejected operation corresponds to.
 ///
@@ -397,6 +398,10 @@ pub fn replay(trace: &str) -> Result<String, String> {
     let mut queue: Option<FreeQueue> = None;
     let mut map = BlockHashToBlockMap::new();
     let mut pool: Option<BlockPool> = None;
+    // `Request`-shaped inputs. `pool_request` appends one; the cache entry points read the one
+    // the trace names. Python keeps the hashes at `hash_block_size` granularity plus the token
+    // ids a `BlockStored` event carries.
+    let mut requests: Vec<(Vec<Vec<u8>>, Vec<i64>)> = Vec::new();
     let mut hashes = HashList::Raw(Vec::new());
     // The harness starts with an empty raw list at a block size of 16, the same defaults the
     // Python driver uses, so a trace can begin with any hash-list operation.
@@ -413,6 +418,7 @@ pub fn replay(trace: &str) -> Result<String, String> {
             &mut queue,
             &mut map,
             &mut pool,
+            &mut requests,
             &mut hashes,
             &mut hash_block_size,
         )
@@ -427,6 +433,7 @@ fn apply(
     queue: &mut Option<FreeQueue>,
     map: &mut BlockHashToBlockMap,
     pool: &mut Option<BlockPool>,
+    requests: &mut Vec<(Vec<Vec<u8>>, Vec<i64>)>,
     hashes: &mut HashList,
     hash_block_size: &mut usize,
 ) -> Result<Vec<String>, String> {
@@ -544,15 +551,17 @@ fn apply(
             })
         }
         "pool_init" => {
-            let usage = "pool_init <num_blocks> <0|1 caching> <0|1 events> <0|1 metrics> <medium>";
+            let usage = "pool_init <num_blocks> <0|1 caching> <hash_block_size> <0|1 events> <0|1 metrics> <medium>";
             let num_blocks = parse_usize(need(parts, 1, usage)?)?;
             let enable_caching = parse_bool(need(parts, 2, usage)?)?;
-            let enable_events = parse_bool(need(parts, 3, usage)?)?;
-            let collect_metrics = parse_bool(need(parts, 4, usage)?)?;
-            let medium = need(parts, 5, usage)?;
+            let hash_block_size = parse_i64(need(parts, 3, usage)?)?;
+            let enable_events = parse_bool(need(parts, 4, usage)?)?;
+            let collect_metrics = parse_bool(need(parts, 5, usage)?)?;
+            let medium = need(parts, 6, usage)?;
             match BlockPool::new(
                 num_blocks,
                 enable_caching,
+                hash_block_size,
                 enable_events,
                 collect_metrics,
                 medium,
@@ -643,6 +652,80 @@ fn apply(
             match pool {
                 Some(pool) => Ok(result(pool.insert_block_hash(&key, block, num_tokens))),
                 None => Err("pool_set_hash before pool_init".to_string()),
+            }
+        }
+        "pool_request" => {
+            let usage = "pool_request <hash,hash,...> <token,token,...>";
+            let block_hashes = parse_hex_list(need(parts, 1, usage)?)?;
+            let all_token_ids = parse_i64_list(need(parts, 2, usage)?)?;
+            requests.push((block_hashes, all_token_ids));
+            Ok(ok())
+        }
+        "pool_cache_full" => {
+            let usage = "pool_cache_full <request_idx> <num_cached_blocks> <num_full_blocks> \
+                         <block_size> <group_id> <mask|-> <block_id>...";
+            let request = parse_usize(need(parts, 1, usage)?)?;
+            let num_cached_blocks = parse_usize(need(parts, 2, usage)?)?;
+            let num_full_blocks = parse_usize(need(parts, 3, usage)?)?;
+            let block_size = parse_i64(need(parts, 4, usage)?)?;
+            let group_id = parse_u32(need(parts, 5, usage)?)?;
+            let mask = match need(parts, 6, usage)? {
+                "-" => None,
+                flags => Some(parse_bool_list(flags)?),
+            };
+            let blocks = decode_u64s(&parts[7..])?;
+            let Some((block_hashes, all_token_ids)) = requests.get(request) else {
+                return Err(format!("pool_request index {request} was never recorded"));
+            };
+            let view = RequestView {
+                block_hashes,
+                all_token_ids,
+            };
+            match pool {
+                Some(pool) => Ok(result(pool.cache_full_blocks(
+                    &view,
+                    &blocks,
+                    num_cached_blocks,
+                    num_full_blocks,
+                    block_size,
+                    group_id,
+                    mask.as_deref(),
+                ))),
+                None => Err("pool_cache_full before pool_init".to_string()),
+            }
+        }
+        "pool_cache_partial" => {
+            let usage = "pool_cache_partial <request_idx> <block_id> <num_tokens> <group_id> \
+                         <block_size> <0|1 replace_existing_hashes>";
+            let request = parse_usize(need(parts, 1, usage)?)?;
+            let block = parse_u64(need(parts, 2, usage)?)?;
+            let num_tokens = parse_i64(need(parts, 3, usage)?)?;
+            let group_id = parse_u32(need(parts, 4, usage)?)?;
+            let block_size = parse_i64(need(parts, 5, usage)?)?;
+            let replace_existing_hashes = parse_bool(need(parts, 6, usage)?)?;
+            let Some((block_hashes, all_token_ids)) = requests.get(request) else {
+                return Err(format!("pool_request index {request} was never recorded"));
+            };
+            let view = RequestView {
+                block_hashes,
+                all_token_ids,
+            };
+            match pool {
+                Some(pool) => Ok(
+                    match pool.cache_partial_block(
+                        &view,
+                        block,
+                        num_tokens,
+                        group_id,
+                        block_size,
+                        replace_existing_hashes,
+                    ) {
+                        Ok(Some(key)) => ok_value(hex_encode(&key)),
+                        Ok(None) => ok_value("-".to_string()),
+                        Err(error) => err(error),
+                    },
+                ),
+                None => Err("pool_cache_partial before pool_init".to_string()),
             }
         }
         "pool_cached" => {
@@ -755,6 +838,32 @@ fn need<'a>(parts: &[&'a str], index: usize, usage: &str) -> Result<&'a str, Str
         .get(index)
         .copied()
         .ok_or_else(|| format!("missing argument, expected `{usage}`"))
+}
+
+/// A comma separated list of hex byte strings, as `pool_request` carries its hashes.
+fn parse_hex_list(token: &str) -> Result<Vec<Vec<u8>>, String> {
+    token.split(',').map(hex_decode).collect()
+}
+
+/// A comma separated list of integers.
+fn parse_i64_list(token: &str) -> Result<Vec<i64>, String> {
+    token.split(',').map(parse_i64).collect()
+}
+
+/// A comma separated list of `0`/`1` flags.
+fn parse_bool_list(token: &str) -> Result<Vec<bool>, String> {
+    token.split(',').map(parse_bool).collect()
+}
+
+/// Space separated block ids, the shape every pool operation uses for its tail.
+fn decode_u64s(tokens: &[&str]) -> Result<Vec<u64>, String> {
+    tokens.iter().map(|token| parse_u64(token)).collect()
+}
+
+fn parse_u32(token: &str) -> Result<u32, String> {
+    token
+        .parse::<u32>()
+        .map_err(|_| format!("expected a KV cache group id, got `{token}`"))
 }
 
 fn parse_usize(token: &str) -> Result<usize, String> {
@@ -948,7 +1057,7 @@ map_dump -> ok a1:5
     #[test]
     fn replay_drives_the_pool_operations() {
         let trace = "\
-pool_init 4 1 0 0 GPU
+pool_init 4 1 32 0 0 GPU
 pool_order
 pool_new 2
 pool_set_hash 1 aa 32
@@ -962,7 +1071,7 @@ pool_reset
 pool_dump
 ";
         let expected = "\
-pool_init 4 1 0 0 GPU -> ok
+pool_init 4 1 32 0 0 GPU -> ok
 pool_order -> ok 1 2 3
 pool_new 2 -> ok 1 2
 pool_set_hash 1 aa 32 -> ok
@@ -976,5 +1085,62 @@ pool_reset -> ok 1
 pool_dump -> ok free=3 map=0 watchers=- events=- metrics=none 0:0:-:-:- 1:0:-:-:- 2:0:-:-:- 3:0:-:-:-
 ";
         assert_eq!(replay(trace).unwrap(), expected);
+    }
+
+    #[test]
+    fn replay_drives_the_request_based_cache_entry_points() {
+        // Two hashes per request: a 32-token and a 64-token block size, a partial entry inside
+        // the block, and the events both paths queue. The null block is passed in the first
+        // slot of the second call, so its hash is skipped on both sides.
+        let trace = "\
+pool_init 4 1 32 1 0 GPU
+pool_new 2
+pool_request 40112233,41112233,42112233,43112233 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127
+pool_cache_full 0 0 2 32 1 - 1 2
+pool_take_events
+pool_cache_partial 0 1 96 1 64 0
+pool_take_events
+pool_dump
+";
+        let output = replay(trace).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[0], "pool_init 4 1 32 1 0 GPU -> ok");
+        assert_eq!(lines[1], "pool_new 2 -> ok 1 2");
+        assert_eq!(lines[2].split_whitespace().next(), Some("pool_request"));
+        assert_eq!(lines[3], "pool_cache_full 0 0 2 32 1 - 1 2 -> ok");
+        // One `stored` event for the call: both hashes, no parent, the token range, 32-token
+        // blocks, group 1, and one empty extra-key entry per block.
+        let tokens: String = (0..64).map(|token| token.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(
+            lines[4],
+            format!("pool_take_events -> ok stored:40112233,41112233:-:{tokens}:32:1:GPU:~,~")
+        );
+        // The partial entry sits 96 tokens into block 1, whose cached entry covered 32: the old
+        // key is dropped with a BlockRemoved event first, then the new one is stored with the
+        // 32 tokens between 64 and 96. The hash at 96 tokens is the request's third one, so its
+        // parent is the second.
+        assert_eq!(
+            lines[5],
+            "pool_cache_partial 0 1 96 1 64 0 -> ok 4211223300000001"
+        );
+        let tail_tokens: String =
+            (64..96).map(|token| token.to_string()).collect::<Vec<_>>().join(",");
+        assert_eq!(
+            lines[6],
+            format!(
+                "pool_take_events -> ok removed:40112233:1:GPU \
+                 stored:42112233:41112233:{tail_tokens}:32:1:GPU:~"
+            )
+        );
+        let dump = lines[7];
+        assert!(dump.contains("map=2"), "dump was {dump}");
+        assert!(
+            dump.contains("1:1:4211223300000001:96:-"),
+            "the promoted block keeps its new primary hash: {dump}"
+        );
+        assert!(
+            dump.contains("2:1:4111223300000001:64:-"),
+            "the untouched block keeps its entry: {dump}"
+        );
     }
 }
