@@ -4,6 +4,34 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ## Unreleased
 
+### Scheduler shadow skeleton
+
+The scheduler is step 3 of the `v1/core` spike and the only piece whose correctness cannot be
+argued from state, so it has to run as a shadow. The skeleton of that shadow is in place — the
+oracle and the contract, not the comparison:
+
+- New `tools/gen_scheduler_trace.py` drives the **real** `Scheduler` (through the repository's own
+  fixtures in `tests/v1/core/utils.py`) over a seeded synthetic workload and records both halves:
+  `trace.txt` is the workload and the model replies it was fed, `expected.txt` is what it decided
+  — first-time versus cached requests, tokens per request, preemptions, common-prefix blocks and
+  the pool's free-block count per step. Prompt lengths straddle block boundaries so chunked
+  prefill produces multi-step prefills, some prompts are shared so the prefix cache hits, and the
+  driver runs a pool too small for its batch as well as a roomy one, so preemption and resumption
+  both happen.
+- A trace is only written when every decision passed ten invariant families (`total-matches-sum`,
+  `scheduled-matches-tokens`, `no-duplicate-request`, `positive-token-count`,
+  `bounded-token-count`, `free-blocks-in-range`, `finished-once`, `queue-drains`,
+  `finished-count`, `blocks-released`), so the recording is self-consistent and the checks are the
+  first thing a port is compared against. `blocks-released` is the strongest: every block the
+  scheduler took has to be back in the pool at the end, with the prefix cache enabled.
+- New `tools/check_scheduler_shadow.sh` sweeps three configurations per seed. Verified with 3
+  seeds × 3 configurations: **9 runs, 150 scheduling steps, 90 requests, no violations**,
+  including 136 steps with cached requests, 3 preemption steps (3 of them resumed) and 6 steps
+  with common prefix blocks. It runs on CPU with a model *config* directory and no weights, and
+  `validate_all.sh --with-scheduler` skips it (rather than failing) when that directory is
+  missing. Documented in `docs/scheduler-shadow.md`, which also states what is deliberately not
+  there yet: the port to compare against.
+
 ### Startup instrumentation: where the 51 s actually go
 
 The timeline report showed that most of startup was silence, so the silent parts are now

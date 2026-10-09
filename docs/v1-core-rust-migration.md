@@ -159,8 +159,9 @@ report a non-zero eviction count. The crate's own 31 unit tests pin down what th
 see — that a popped block really has no links left, that the map drops a key only with its last
 block, and that the null block is never allocated.
 
-What this does **not** cover: anything downstream of the pool — the scheduler decisions — and
-`Request` itself, which the harness stands in for as described above.
+What this does **not** cover: anything downstream of the pool — the scheduler decisions, whose
+shadow skeleton is described in `docs/scheduler-shadow.md` — and `Request` itself, which the
+harness stands in for as described above.
 
 ## Why this is not a performance project
 
@@ -199,7 +200,12 @@ Recommended order:
    risk lived, not in hashing.
 2. **Scheduler decisions** (`sched/scheduler.py`, its own 3,474 lines): must run as a
    shadow first, comparing decisions against the Python scheduler on the same traffic
-   before anything is cut over.
+   before anything is cut over. The skeleton of that shadow exists — `tools/gen_scheduler_trace.py`
+   records the real scheduler's decisions for a seeded workload and `tools/check_scheduler_shadow.sh`
+   enforces the ten invariant families those decisions have to satisfy (9 runs, 150 steps, 90
+   requests verified, CPU only) — documented in `docs/scheduler-shadow.md`. What is still missing is
+   the port to compare against: a Rust reader for `trace.txt` that has to reproduce `expected.txt`
+   byte for byte, on top of the already shadow-verified block pool.
 3. Move the Rust-owned scheduler behind the `managed-engine` / M3–M4 process work, and
    only then shrink Python to a worker that executes the decided batches.
 

@@ -127,6 +127,7 @@ bash tools/validate_all.sh                 # 静态检查：bash -n、py_compile
 bash tools/validate_all.sh --with-parity   # 另加跨语言一致性（前缀哈希、块簿记）
 bash tools/validate_all.sh --with-chat     # 另加真实路由上的对话回归
 bash tools/validate_all.sh --with-audit    # 另加依赖审计与实测版本清单核对
+bash tools/validate_all.sh --with-scheduler # 另加调度器影子（仅 CPU，需模型 config 目录）
 bash tools/validate_all.sh --full          # 以上全部
 ```
 
@@ -142,8 +143,10 @@ Python 文件参与编译，因此可覆盖 AGENTS.md 里的
 - [依赖审计](docs/dependency-audit.zh-CN.md) —— 真实服务实际导入/映射了什么，以及实测得到的
   固定版本清单 `requirements/definitive-2080ti-measured.txt`。
 - [v1/core Rust 迁移](docs/v1-core-rust-migration.zh-CN.md) —— Rust 重写与 Python 原版的逐字节
-  前缀哈希一致性，以及 KV 缓存块池与其块大小感知哈希视图的影子校验，以及为什么它属于架构改变
-  而非性能提升。
+  前缀哈希一致性，以及 KV 缓存块池（空闲队列、哈希映射、块大小视图、事件队列、指标收集器、
+  依赖 `Request` 的缓存入口）的影子校验，以及为什么它属于架构改变而非性能提升。
+- [调度器影子](docs/scheduler-shadow.zh-CN.md) —— 移植调度器的骨架：真实 `Scheduler` 在带种子
+  工作负载上产生的决策轨迹、这些决策必须满足的十类不变式，以及移植版将来要对照的基准。
 - [启动时间线](docs/startup-timeline.zh-CN.md) —— ~53s 的启动时间实际花在哪：引擎自己测到的部分、
   只表现为日志沉默的部分，以及读一份由两个进程写入的日志时的口径限制。
 

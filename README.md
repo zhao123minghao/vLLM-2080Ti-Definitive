@@ -137,6 +137,7 @@ bash tools/validate_all.sh                 # static: bash -n, py_compile, profil
 bash tools/validate_all.sh --with-parity   # + cross-language parity (prefix hash, block pool)
 bash tools/validate_all.sh --with-chat     # + chat regression on a live route
 bash tools/validate_all.sh --with-audit    # + dependency audit and the measured pin set
+bash tools/validate_all.sh --with-scheduler # + scheduler shadow (CPU only, needs a model config)
 bash tools/validate_all.sh --full          # everything above
 ```
 
@@ -155,8 +156,12 @@ Python, which covers the "py_compile <changed-python-files>" step:
   `requirements/definitive-2080ti-measured.txt`.
 - [v1/core Rust migration](docs/v1-core-rust-migration.md) — byte-exact prefix-hash parity
   between the Rust re-implementation and the Python original, plus the shadow verification of
-  the KV-cache block pool and its block-size-aware hash view, and why it is an architecture
-  change rather than a speedup.
+  the KV-cache block pool (free queue, hash map, block-size view, event queue, metrics collector,
+  the `Request`-based cache entry points), and why it is an architecture change rather than a
+  speedup.
+- [Scheduler shadow](docs/scheduler-shadow.md) — the skeleton for porting the scheduler: the
+  decision trace the real `Scheduler` produces for a seeded workload, the ten invariant families
+  those decisions have to satisfy, and what the port will be compared against.
 - [Startup timeline](docs/startup-timeline.md) — where the ~53 s of startup actually goes:
   what the engine measures itself, what only shows up as silence in the log, and the caveats of
   reading a log written by two processes.

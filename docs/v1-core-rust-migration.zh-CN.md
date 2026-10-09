@@ -118,7 +118,7 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --po
  diff 看不到的部分——被弹出的块确实不再持有任何指针、映射只在最后一个块被弹出时才删键、null 块
 永不参与分配。
 
-尚未覆盖的部分：池下游的东西——调度器决策——以及 `Request` 本身，如上一段所述由替身提供。
+尚未覆盖的部分：池下游的东西——调度器决策，其影子骨架见 `docs/scheduler-shadow.zh-CN.md`——以及 `Request` 本身，如上一段所述由替身提供。
 
 ## 为什么这不是一个性能项目
 
@@ -139,7 +139,7 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --po
 建议顺序如下：
 
 1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图、KV 缓存事件队列、指标收集器、依赖 `Request` 的缓存入口与 `BlockPool` 本体均已移植并通过影子校验（见上文），因此这一步已完成；剩下属于 `Request` 自身的部分（它的哈希与 token 记账）由校验脚本替身提供。真正的语义风险曾经在这里，不在哈希。
-2. **调度决策**（`sched/scheduler.py`，自身 3,474 行）：必须先以影子模式运行，在同一条流量上把决策序列与 Python 调度器对比，之后才谈切换。
+2. **调度决策**（`sched/scheduler.py`，自身 3,474 行）：必须先以影子模式运行，在同一条流量上把决策序列与 Python 调度器对比，之后才谈切换。这套影子的骨架已经存在——`tools/gen_scheduler_trace.py` 记录真实调度器在带种子工作负载上的决策，`tools/check_scheduler_shadow.sh` 强制这些决策必须满足的十类不变式（已验证 9 次运行、150 个调度步、90 个请求，仅用 CPU），详见 `docs/scheduler-shadow.zh-CN.md`。仍缺的是用来对比的移植版：一个读取 `trace.txt` 的 Rust 端，它必须在已经过影子校验的块池之上逐字节复现 `expected.txt`。
 3. 把 Rust 侧调度器放到 `managed-engine` / M3–M4 的进程工作之后，最后才把 Python 收缩为执行已决定批次的 worker。
 
 注意 `v1/core` 中只有 `sched/output.py` 导入 torch，因此该包其余部分没有计算依赖，可以在不触碰 torch 路径的前提下迁移。

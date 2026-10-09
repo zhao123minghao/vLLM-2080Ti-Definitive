@@ -66,6 +66,7 @@ bash tools/validate_all.sh                 # the four static steps above
 bash tools/validate_all.sh --with-parity   # + the cross-language parity checks
 bash tools/validate_all.sh --with-chat     # + the chat regression
 bash tools/validate_all.sh --with-audit    # + the dependency audit and minimal-set check
+bash tools/validate_all.sh --with-scheduler # + the scheduler shadow
 bash tools/validate_all.sh --full          # all of them
 ```
 
@@ -98,6 +99,16 @@ chat regression against a live route (it starts and stops the reference route it
 
 ```bash
 bash tools/chat_smoke.sh --launch --quick
+```
+
+For changes to the scheduler (`vllm/v1/core/sched/scheduler.py`) or to the block bookkeeping it
+drives, run the scheduler shadow. It drives the real scheduler over a seeded workload on CPU and
+checks the invariants every decision has to satisfy; it needs a model *config* directory (no
+weights) and skips nothing silently:
+
+```bash
+bash tools/check_scheduler_shadow.sh
+SCHED_SHADOW_MODEL=/path/to/model bash tools/check_scheduler_shadow.sh
 ```
 
 For dependency, requirement or environment changes (adding, pruning or replacing packages),
