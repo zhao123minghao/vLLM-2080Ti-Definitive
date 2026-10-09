@@ -81,6 +81,14 @@ bash tools/check_prefix_hash_parity.sh --num-blocks 200
   刻意不比较：`take_events()` 在 `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES` 下把哈希字节改写成
   整数（校验脚本把它关掉，双方打印的都是池自己的字节），以及收集器记录的墙钟时长
   （`sample_rate=1.0` 让采样无任何可判定空间，而时长本身不可复现）。
+* 依赖 **`Request` 的缓存入口**：`cache_full_blocks` 与 `cache_partial_block`——请求的哈希真正进池的
+  地方。两者都已复现：在 `request.block_hashes` 上按块大小取视图、跳过 null 与被掩掉的块、
+  partial→full 提升时先删掉旧条目（连同它们的事件）再让完整块哈希接管、把一个已存在的块从块内
+  细粒度边界上变得可达的部分条目（含 `replace_existing_hashes` 与三条件提升分支），以及每次调用
+  入队的那一个 `BlockStored` 事件——哈希列表、父哈希、事件覆盖的 token 区间、块大小、组 id、介质
+  与额外键。`Request` 本身是替身：轨迹直接携带真实请求本该算出的哈希与 token id，且建模的请求是
+  纯文本的，因此 LoRA 名、多模态标识、cache salt 与 prompt embedding 哈希永远不会出现在额外键里
+  （那些由前缀哈希一致性检查覆盖）。
 
 `tools/check_block_pool_parity.sh` 把哈希那套方法变成了生成器：
 
@@ -101,15 +109,16 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --po
 集合迭代顺序遍历，因此一次多块调用所入队事件的**顺序**属于 CPython 集合布局的实现细节，移植版
 无法复现。多块形式保留在不产生任何事件的关闭态轮次里。
 
-已验证：6 个种子 × 2 种模式、每轮约 717 步（**共比较 8,602 步，730 步被 Python 拒绝**：271
-`ValueError`、276 `AssertionError`、183 `IndexError`），日志逐行一致，包括每次拒绝所报的异常
-类型。事件与指标那一半贡献了 107 步 `take_events`、98 步 `drain_metrics`、226 个入队事件 token
-（223 个 `removed:`、3 个 `cleared:`）以及 75 份 `pool_dump` 快照，其中 55 份的驱逐计数非零。
-crate 自带 26 个单测锁住 diff 看不到的部分——被弹出的块确实不再持有任何指针、映射只在最后一个
-块被弹出时才删键、null 块永不参与分配。
+已验证：6 个种子 × 2 种模式、每轮约 717 步（**共比较 8,606 步，691 步被 Python 拒绝**：222
+`ValueError`、313 `AssertionError`、156 `IndexError`），日志逐行一致，包括每次拒绝所报的异常
+类型。122 个已记录请求驱动了 186 次 `cache_full_blocks` 与 149 次 `cache_partial_block`（其中
+51 次双方同样拒绝），它们入队的事件逐字段比较过。事件与指标那一半贡献了 211 步 `take_events`、
+123 步 `drain_metrics` 与 272 个事件 token——138 个 `stored:`、263 个 `removed:`、9 个
+`cleared:`——以及 54 份 `pool_dump` 快照，其中 41 份的驱逐计数非零。crate 自带 31 个单测锁住
+ diff 看不到的部分——被弹出的块确实不再持有任何指针、映射只在最后一个块被弹出时才删键、null 块
+永不参与分配。
 
-尚未覆盖的部分：`BlockPool` 中依赖 `Request` 的入口（`cache_full_blocks`、
-`cache_partial_block`）、它们发出的 `BlockStored` 事件，以及池之上的调度器决策。
+尚未覆盖的部分：池下游的东西——调度器决策——以及 `Request` 本身，如上一段所述由替身提供。
 
 ## 为什么这不是一个性能项目
 
@@ -129,7 +138,7 @@ crate 自带 26 个单测锁住 diff 看不到的部分——被弹出的块确�
 
 建议顺序如下：
 
-1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图、KV 缓存事件队列、指标收集器与 `BlockPool` 本体均已移植并通过影子校验（见上文）；这一步剩下的是依赖 `Request` 的 `cache_full_blocks` / `cache_partial_block` 入口以及它们发出的 `BlockStored` 事件。真正的语义风险在这里，不在哈希。
+1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图、KV 缓存事件队列、指标收集器、依赖 `Request` 的缓存入口与 `BlockPool` 本体均已移植并通过影子校验（见上文），因此这一步已完成；剩下属于 `Request` 自身的部分（它的哈希与 token 记账）由校验脚本替身提供。真正的语义风险曾经在这里，不在哈希。
 2. **调度决策**（`sched/scheduler.py`，自身 3,474 行）：必须先以影子模式运行，在同一条流量上把决策序列与 Python 调度器对比，之后才谈切换。
 3. 把 Rust 侧调度器放到 `managed-engine` / M3–M4 的进程工作之后，最后才把 Python 收缩为执行已决定批次的 worker。
 

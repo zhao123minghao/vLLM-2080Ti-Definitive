@@ -36,11 +36,13 @@ Usage:
 
 The trace covers three objects: a standalone `FreeKVCacheBlockQueue`, a standalone
 `BlockHashToBlockMap`, and a real `BlockPool` built on both. The pool ops drive its public
-allocation, free, touch, unpin, eviction and reset paths, and install cache entries through
-the same private helpers Python uses (`_insert_block_hash`, and the cache map for lookups),
-so no hashing happens on this side — the trace carries the hashes the allocator would have
-computed. `--pool-events` and `--pool-metrics` add the two optional observers: `take_events` /
-`drain_metrics` operations and the queued events and tracked blocks the pool dump reports.
+allocation, free, touch, unpin, eviction and reset paths, install cache entries directly through
+the same private helper Python uses (`_insert_block_hash`, and the cache map for lookups), and
+call the `Request`-based entry points (`cache_full_blocks`, `cache_partial_block`) with a
+stand-in request whose hashes and token ids the trace carries. No hashing happens on this side —
+the trace carries the hashes the allocator would have computed. `--pool-events` and
+`--pool-metrics` add the two optional observers: `take_events` / `drain_metrics` operations and
+the queued events and tracked blocks the pool dump reports.
 Two things are outside the comparison on purpose: the integer rewrite of block hash bytes that
 `take_events` performs (switched off at the top of this file) and the collector's wall-clock
 durations (the deterministic half is what is compared).
@@ -79,6 +81,30 @@ from vllm.v1.core.kv_cache_utils import (  # noqa: E402
 # group id, which is what the KV-cache events strip apart again.
 KEY_BYTES = 0xA0
 POOL_KEY_BYTES = 0xB0
+
+# The granularity of the hashes a request carries, i.e. `BlockPool(hash_block_size=...)`. A
+# group's `block_size` can be a multiple of it, which is what the block-size view is for.
+HASH_BLOCK_SIZE = 32
+
+
+class SyntheticRequest:
+    """The `Request` attributes the prefix-cache entry points read.
+
+    A real `Request` computes `block_hashes` by hashing its tokens; the trace carries the
+    hashes instead (`hash_block_tokens` is covered by the prefix-hash parity check). The rest of
+    the attributes are the ones `generate_block_hash_extra_keys` and the `BlockStored` event
+    read: the modelled request is text-only, so its multi-modal features, LoRA request, cache
+    salt, prompt embeddings and session id are all empty or `None`.
+    """
+
+    def __init__(self, block_hashes: list[bytes], all_token_ids: list[int]) -> None:
+        self.block_hashes = block_hashes
+        self.all_token_ids = all_token_ids
+        self.mm_features: list = []
+        self.lora_request = None
+        self.cache_salt = None
+        self.prompt_embeds = None
+        self.session_id = None
 
 
 class Recorder:
@@ -396,6 +422,8 @@ class PoolDriver:
         self.pool: BlockPool | None = None
         # Blocks handed out and not yet given back, i.e. what a request would hold.
         self.held: list[int] = []
+        # Requests whose hashes and tokens the cache entry points read.
+        self.requests: list[SyntheticRequest] = []
         # Block 0 is the pool's null block; it is never allocated, cached or touched.
         self.block_ids = list(range(1, num_blocks))
 
@@ -477,13 +505,14 @@ class PoolDriver:
         self.pool = BlockPool(
             num_gpu_blocks=self.num_blocks,
             enable_caching=self.enable_caching,
-            hash_block_size=32,
+            hash_block_size=HASH_BLOCK_SIZE,
             enable_kv_cache_events=self.enable_events,
             metrics_collector=collector,
         )
         self.held = []
+        self.requests = []
         self._record(
-            f"pool_init {self.num_blocks} {int(self.enable_caching)} "
+            f"pool_init {self.num_blocks} {int(self.enable_caching)} {HASH_BLOCK_SIZE} "
             f"{int(self.enable_events)} {int(self.collect_metrics)} {MEDIUM_GPU}",
             ["ok"],
         )
@@ -500,6 +529,118 @@ class PoolDriver:
             self.pool.metrics_collector.drain_events()
         )
         self._record("pool_drain_metrics", ["ok", str(drained)])
+
+    def op_request(self) -> None:
+        """Record a request whose hashes and tokens the cache entry points can read.
+
+        A real `Request` hashes its tokens to get `block_hashes`; the trace carries the hashes
+        instead, because hashing is already covered by the prefix-hash parity check. The token
+        ids are carried too: they are what a `BlockStored` event publishes.
+        """
+        num_hashes = self.rng.randint(1, 4)
+        hashes = [bytes([0x90 + num_hashes, 0x12, 0x34, 0x50 + i]) for i in range(num_hashes)]
+        tokens = [1000 * len(self.requests) + i for i in range(num_hashes * HASH_BLOCK_SIZE)]
+        self.requests.append(SyntheticRequest(hashes, tokens))
+        self._record(
+            "pool_request {} {}".format(
+                ",".join(hash_.hex() for hash_ in hashes),
+                ",".join(str(token) for token in tokens),
+            ),
+            ["ok"],
+        )
+
+    def op_cache_full(self) -> None:
+        assert self.pool is not None
+        request_index = self.rng.randrange(len(self.requests))
+        request = self.requests[request_index]
+        block_size = self.rng.choice([HASH_BLOCK_SIZE, HASH_BLOCK_SIZE * 2])
+        # How many group blocks the request's hashes describe once they are viewed at
+        # `block_size`; asking for more would be an IndexError inside the pool on both sides, and
+        # the trace is about the caching path rather than about that.
+        available = len(request.block_hashes) // (block_size // HASH_BLOCK_SIZE)
+        if available == 0:
+            self.op_num_free()
+            return
+        num_full_blocks = self.rng.randint(1, available)
+        num_cached_blocks = self.rng.choice(
+            [0, 0, 1, min(1, num_full_blocks), num_full_blocks]
+        )
+        blocks = self.held[:num_full_blocks]
+        if len(blocks) < num_full_blocks:
+            self.op_num_free()
+            return
+        if self.rng.random() < 0.15:
+            # The scheduler passes its own slots, and a null slot is legal input: the pool skips
+            # it instead of caching a hash that nothing can ever hit.
+            blocks[self.rng.randrange(len(blocks))] = 0
+        mask: list[bool] | None = None
+        if num_full_blocks > num_cached_blocks and self.rng.random() < 0.2:
+            mask = [self.rng.random() < 0.7 for _ in range(num_full_blocks - num_cached_blocks)]
+        group_id = self.rng.randrange(4)
+        operation = "pool_cache_full {} {} {} {} {} {} {}".format(
+            request_index,
+            num_cached_blocks,
+            num_full_blocks,
+            block_size,
+            group_id,
+            "-" if mask is None else ",".join("1" if flag else "0" for flag in mask),
+            " ".join(str(block_id) for block_id in blocks),
+        )
+        self._call(
+            operation,
+            lambda: self.pool.cache_full_blocks(
+                request,
+                [self._block(block_id) for block_id in blocks],
+                num_cached_blocks,
+                num_full_blocks,
+                block_size,
+                group_id,
+                mask,
+            ),
+        )
+
+    def op_cache_partial(self) -> None:
+        assert self.pool is not None
+        request_index = self.rng.randrange(len(self.requests))
+        request = self.requests[request_index]
+        # A partial entry lives inside an owning group block, so the non-replacement path needs a
+        # `block_size` larger than the hash granularity. Asking for a block of exactly that size
+        # is not a partial entry at all, and leaving `replace_existing_hashes` alone there is what
+        # covers that AssertionError.
+        block_size = HASH_BLOCK_SIZE if self.rng.random() < 0.15 else HASH_BLOCK_SIZE * 2
+        block_id = 0 if self.rng.random() < 0.1 else self.rng.choice(self.held)
+        boundaries = [HASH_BLOCK_SIZE * n for n in range(1, len(request.block_hashes) + 1)]
+        num_tokens = self.rng.choice(boundaries)
+        replace = self.rng.random() < 0.5
+        if self.enable_events and self.pool.blocks[block_id].block_hash is not None:
+            # A second hash on one block would make the order of the `BlockRemoved` events a set
+            # iteration order; the runs without events keep that case.
+            replace = True
+        elif not replace and block_size > HASH_BLOCK_SIZE and num_tokens % block_size == 0:
+            # The boundary has to sit *inside* the owning block; if the request has none, the
+            # only way the call can pass its assertion is to replace the existing hashes.
+            partial = [boundary for boundary in boundaries if boundary % block_size != 0]
+            if partial:
+                num_tokens = self.rng.choice(partial)
+            else:
+                replace = True
+        group_id = self.rng.randrange(4)
+        operation = "pool_cache_partial {} {} {} {} {} {}".format(
+            request_index,
+            block_id,
+            num_tokens,
+            group_id,
+            block_size,
+            int(replace),
+        )
+        try:
+            key = self.pool.cache_partial_block(
+                request, self._block(block_id), num_tokens, group_id, block_size, replace
+            )
+        except Exception as exc:  # noqa: BLE001 - the class name is the expectation
+            self.rec._record_error(operation, exc)
+            return
+        self._record(operation, ["ok", "-" if key is None else bytes(key).hex()])
 
     def _events_dump(self) -> str:
         assert self.pool is not None
@@ -546,14 +687,36 @@ class PoolDriver:
         (`get_block_hash`), and the event carries the group id it recovered, so both come
         straight from the payload instead of being re-derived here.
         """
-        if event.__class__.__name__ == "AllBlocksCleared":
+        name = event.__class__.__name__
+        if name == "AllBlocksCleared":
             return [f"cleared:{MEDIUM_GPU}"]
+        if name == "BlockStored":
+            return [self._stored_token(event)]
         group_idx = getattr(event, "group_idx", None)
         group_idx = 0 if group_idx is None else int(group_idx)
         return [
             f"removed:{self._hash_hex(block_hash)}:{group_idx}:{event.medium}"
             for block_hash in event.block_hashes
         ]
+
+    def _stored_token(self, event) -> str:
+        """`stored:...`, the canonical form of one `BlockStored` event.
+
+        Field order matches the Rust `PoolEvent::canonical_for_log`. The extra keys are all
+        `None` for the text-only request this harness models, so only their count is compared —
+        and whether Python passed a list at all, which is why an empty list renders as `-`.
+        """
+        parent = event.parent_block_hash
+        extra_keys = event.extra_keys
+        return "stored:{}:{}:{}:{}:{}:{}:{}".format(
+            ",".join(self._hash_hex(hash_) for hash_ in event.block_hashes) or "-",
+            self._hash_hex(parent) if parent is not None else "-",
+            ",".join(str(token) for token in event.token_ids) or "-",
+            event.block_size,
+            event.group_idx,
+            event.medium,
+            "-" if extra_keys is None else ",".join("~" for _ in extra_keys),
+        )
 
     def op_new(self, count: int) -> None:
         assert self.pool is not None
@@ -659,8 +822,11 @@ class PoolDriver:
                 "dump",
                 "take_events",
                 "drain_metrics",
+                "request",
+                "cache_full",
+                "cache_partial",
             ],
-            weights=[10, 8, 4, 5, 3, 8, 7, 3, 1, 3, 2, 2, 2, 4, 3],
+            weights=[10, 8, 4, 5, 3, 8, 7, 3, 1, 3, 2, 2, 2, 4, 3, 2, 6, 5],
         )[0]
 
         if choice == "new":
@@ -672,6 +838,18 @@ class PoolDriver:
             self.op_take_events()
         elif choice == "drain_metrics":
             self.op_drain_metrics()
+        elif choice == "request":
+            self.op_request()
+        elif choice == "cache_full":
+            if not self.requests or len(self.held) < 2:
+                self.op_num_free()
+                return
+            self.op_cache_full()
+        elif choice == "cache_partial":
+            if not self.requests or not self.held:
+                self.op_num_free()
+                return
+            self.op_cache_partial()
         elif choice in ("free", "unpin", "touch"):
             ids = self._sample_held()
             if not ids:

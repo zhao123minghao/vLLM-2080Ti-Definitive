@@ -86,8 +86,18 @@ recorded operation trace:
   optional observers are ported as well: the KV-cache event queue (`BlockRemoved` with the
   evicted hash, its group id and the medium, plus `AllBlocksCleared`, drained by `take_events()`)
   and the deterministic half of `KVCacheMetricsCollector` (one access history per allocated
-  block capped at four samples, eviction events, reset, `drain_events()`). The failure
-  modes are part of the contract: `ValueError`, `AssertionError`, `RuntimeError` and
+  block capped at four samples, eviction events, reset, `drain_events()`). The `Request`-based
+  entry points are ported too — `cache_full_blocks` and `cache_partial_block`, i.e. where a
+  request's hashes actually enter the cache: the block-size view over `request.block_hashes`,
+  skipping null and masked-out blocks, the partial-to-full promotion that drops a block's old
+  entries before the full-block hash takes over, the fine-grained partial entry with its
+  `replace_existing_hashes` and promotion branches, and the single `BlockStored` event each
+  call queues (hash list, parent hash, token range, block size, group id, medium, extra keys).
+  The `Request` itself is a stand-in: the trace carries the hashes and token ids a real one
+  would have computed, and it models a text-only request, so LoRA names, multi-modal
+  identifiers, cache salts and prompt-embedding hashes never reach an extra key (the
+  prefix-hash parity check covers those). The failure modes are part of the contract:
+  `ValueError`, `AssertionError`, `RuntimeError` and
   `IndexError` are reproduced as the exception Python would have raised, and the free-block
   counter is signed because Python's `int` can drift negative.
 - New `tools/check_block_pool_parity.sh` plus `tools/gen_block_pool_trace.py`: the recorder
@@ -96,9 +106,11 @@ recorded operation trace:
   rejected operation; the Rust binary replays the trace and the two logs are diffed. Each seed
   runs twice — with the event queue and the metrics collector off, and with both on — so the
   disabled paths stay pinned. Verified with 6 seeds × 2 modes of ~717 operations: **12 traces,
-  8,602 operations compared, 730 rejections, every line identical**, including 107
-  `take_events` and 98 `drain_metrics` operations with 226 queued event tokens, plus 26 crate
-  unit tests for what a log diff cannot see.
+  8,606 operations compared, 691 rejections (222 `ValueError`, 313 `AssertionError`, 156
+  `IndexError`), every line identical**, including 122 recorded requests driving 186
+  `cache_full_blocks` and 149 `cache_partial_block` calls, 211 `take_events` and 123
+  `drain_metrics` operations and 272 event tokens (138 `stored:`, 263 `removed:`, 9 `cleared:`),
+  plus 31 crate unit tests for what a log diff cannot see.
 - Two parts of the event path are deliberately outside the comparison, and both are labelled as
   such: `take_events()` rewrites the block hash bytes into integers unless
   `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` (the harness switches it off so both sides print the

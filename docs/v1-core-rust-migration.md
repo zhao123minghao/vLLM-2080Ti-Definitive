@@ -112,6 +112,18 @@ layers of that state which the scheduler mutates on every step:
   (the harness switches it off, so both sides print the pool's own bytes) and the wall-clock
   durations the collector records (`sample_rate=1.0` leaves sampling nothing to decide, and the
   timings are not reproducible).
+* The **`Request`-based cache entry points**, `cache_full_blocks` and `cache_partial_block` —
+  where a request's hashes actually enter the cache. Both are reproduced: the block-size view
+  over `request.block_hashes`, skipping null and masked-out blocks, the
+  partial-to-full promotion that drops a block's old entries (with their events) before the full
+  block hash takes over, the partial entry that makes an existing block reachable from a
+  fine-grained boundary inside it (including `replace_existing_hashes` and the promotion branch
+  with its three-part condition), and the single `BlockStored` event each call queues — hash
+  list, parent hash, the token range the event covers, block size, group id, medium and the
+  extra keys. The `Request` itself is a stand-in: the trace carries the hashes and token ids the
+  real one would have computed, and the modelled request is text-only, so LoRA names,
+  multi-modal identifiers, cache salts and prompt-embedding hashes never reach an extra key
+  (they are covered by the prefix-hash parity check instead).
 
 `tools/check_block_pool_parity.sh` is the hashing method turned into a generator:
 
@@ -136,18 +148,19 @@ also evicts one block per call instead of a set of them: `BlockPool.evict_blocks
 queues is an implementation detail of CPython's set layout that a port cannot reproduce. The
 multi-id form stays in the events-off runs, where no events are emitted at all.
 
-Verified with 6 seeds × 2 modes of ~717 operations (**12 traces, 8,602 operations compared,
-730 rejected by Python**: 271 `ValueError`, 276 `AssertionError`, 183 `IndexError`): every log
-line matches, including which exception each rejection raises. The events-and-metrics half
-contributes 107 `take_events` and 98 `drain_metrics` operations, 226 queued event tokens (223
-`removed:`, 3 `cleared:`) and 75 `pool_dump` snapshots, 55 of which report a non-zero eviction
-count. The crate's own 26 unit tests pin down what the diff cannot see — that a popped block
-really has no links left, that the map drops a key only with its last block, and that the null
-block is never allocated.
+Verified with 6 seeds × 2 modes of ~717 operations (**12 traces, 8,606 operations compared,
+691 rejected by Python**: 222 `ValueError`, 313 `AssertionError`, 156 `IndexError`): every log
+line matches, including which exception each rejection raises. The 122 recorded requests feed
+186 `cache_full_blocks` and 149 `cache_partial_block` calls (51 of them rejected the same way on
+both sides), and the events they queue are compared field by field. The events-and-metrics half
+contributes 211 `take_events` and 123 `drain_metrics` operations and 272 event tokens — 138
+`stored:` events, 263 `removed:` and 9 `cleared:` — and 54 `pool_dump` snapshots, 41 of which
+report a non-zero eviction count. The crate's own 31 unit tests pin down what the diff cannot
+see — that a popped block really has no links left, that the map drops a key only with its last
+block, and that the null block is never allocated.
 
-What this does **not** cover: `BlockPool`'s `Request`-based entry points (`cache_full_blocks`,
-`cache_partial_block`), the `BlockStored` event they emit, and the scheduler decisions on top of
-the pool.
+What this does **not** cover: anything downstream of the pool — the scheduler decisions — and
+`Request` itself, which the harness stands in for as described above.
 
 ## Why this is not a performance project
 
@@ -179,10 +192,11 @@ Recommended order:
 
 1. **Block pool** (`block_pool.py`, `FreeKVCacheBlockQueue`, `KVCacheBlock`,
    `BlockHashListWithBlockSize`): the mutable state the scheduler touches every step. The free
-   queue, the hash map, the block-size view, the KV-cache event queue, the metrics collector and
-   `BlockPool` itself are now ported and shadow-verified (see above); what is left of this step is
-   the `Request`-based `cache_full_blocks` / `cache_partial_block` entry points and the
-   `BlockStored` events they emit. This is where a real semantics risk lives, not in hashing.
+   queue, the hash map, the block-size view, the KV-cache event queue, the metrics collector, the
+   `Request`-based cache entry points and `BlockPool` itself are ported and shadow-verified (see
+   above), so this step is done apart from the parts of it that belong to `Request` (its hashing
+   and its token bookkeeping), which the harness stands in for. This is where a real semantics
+   risk lived, not in hashing.
 2. **Scheduler decisions** (`sched/scheduler.py`, its own 3,474 lines): must run as a
    shadow first, comparing decisions against the Python scheduler on the same traffic
    before anything is cut over.
