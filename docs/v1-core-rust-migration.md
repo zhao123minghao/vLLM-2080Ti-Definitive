@@ -102,13 +102,23 @@ layers of that state which the scheduler mutates on every step:
   `resolve_block_hashes` (same size, an existing view, fine-grained partial hits keeping the raw
   hashes, and the divisibility assertion). This matters here rather than in theory: the
   deployment runs a hybrid model whose KV cache groups do not all use `hash_block_size`.
+* The pool's KV-cache **event queue** and **metrics collector** — the two optional observers the
+  pool drives. `BlockRemoved` (the evicted hash with its 4-byte group id stripped off, the group
+  id it carries, and the medium) and `AllBlocksCleared` are queued in emission order and handed
+  over by `take_events()`; the collector keeps one access history per allocated block with a cap
+  of four samples, counts eviction events, resets together with the pool, and gives its pending
+  events up on `drain_events()`. Two parts are deliberately not compared: the rewrite of hash
+  bytes into integers that `take_events()` performs under `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES`
+  (the harness switches it off, so both sides print the pool's own bytes) and the wall-clock
+  durations the collector records (`sample_rate=1.0` leaves sampling nothing to decide, and the
+  timings are not reproducible).
 
 `tools/check_block_pool_parity.sh` is the hashing method turned into a generator:
 
 ```bash
 bash tools/check_block_pool_parity.sh
-bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
-# -> block_pool_parity_ok traces=6 operations=7300
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --pool-blocks 24
+# -> block_pool_parity_ok traces=12 operations=8602
 ```
 
 `tools/gen_block_pool_trace.py` drives the **real** Python classes with a seeded random
@@ -118,16 +128,26 @@ binary replays the trace and the two logs are diffed. Sweeping seeds is what mak
 shadow check rather than a unit test: the interesting part is that the *rejections* line up as
 well, which is where a rewrite usually drifts.
 
-Verified with 6 traces of ~1,217 operations (**7,300 operations compared, 3,640 of them pool
-operations and 1,428 hash-list operations, 810 rejected by Python**: 435 `ValueError`, 244
-`AssertionError`, 131 `IndexError`): every log line matches, including which exception each
-rejection raises. The crate's own 23 unit tests pin down what the diff cannot see — that a
-popped block really has no links left, that the map drops a key only with its last block, and
-that the null block is never allocated.
+Each seed is replayed twice, once with the event queue and the metrics collector off and once
+with both on, so the disabled paths stay pinned too (an events-off run always reports an empty
+`take_events`, a `0` from `drain_metrics` and `metrics=none`). With events enabled the harness
+also evicts one block per call instead of a set of them: `BlockPool.evict_blocks` takes a
+`set[int]` and Python iterates it in set order, so the *order* of the events a multi-id call
+queues is an implementation detail of CPython's set layout that a port cannot reproduce. The
+multi-id form stays in the events-off runs, where no events are emitted at all.
 
-What this does **not** cover: the KV-cache event queue, the metrics collector, `BlockPool`'s
-`Request`-based entry points (`cache_full_blocks`, `cache_partial_block`), and the scheduler
-decisions on top of the pool.
+Verified with 6 seeds × 2 modes of ~717 operations (**12 traces, 8,602 operations compared,
+730 rejected by Python**: 271 `ValueError`, 276 `AssertionError`, 183 `IndexError`): every log
+line matches, including which exception each rejection raises. The events-and-metrics half
+contributes 107 `take_events` and 98 `drain_metrics` operations, 226 queued event tokens (223
+`removed:`, 3 `cleared:`) and 75 `pool_dump` snapshots, 55 of which report a non-zero eviction
+count. The crate's own 26 unit tests pin down what the diff cannot see — that a popped block
+really has no links left, that the map drops a key only with its last block, and that the null
+block is never allocated.
+
+What this does **not** cover: `BlockPool`'s `Request`-based entry points (`cache_full_blocks`,
+`cache_partial_block`), the `BlockStored` event they emit, and the scheduler decisions on top of
+the pool.
 
 ## Why this is not a performance project
 
@@ -159,10 +179,10 @@ Recommended order:
 
 1. **Block pool** (`block_pool.py`, `FreeKVCacheBlockQueue`, `KVCacheBlock`,
    `BlockHashListWithBlockSize`): the mutable state the scheduler touches every step. The free
-   queue, the hash map, the block-size view and `BlockPool` itself are now ported and
-   shadow-verified (see above); what is left of this step is the KV-cache event queue, the
-   metrics collector and the `Request`-based `cache_full_blocks` / `cache_partial_block`
-   entry points. This is where a real semantics risk lives, not in hashing.
+   queue, the hash map, the block-size view, the KV-cache event queue, the metrics collector and
+   `BlockPool` itself are now ported and shadow-verified (see above); what is left of this step is
+   the `Request`-based `cache_full_blocks` / `cache_partial_block` entry points and the
+   `BlockStored` events they emit. This is where a real semantics risk lives, not in hashing.
 2. **Scheduler decisions** (`sched/scheduler.py`, its own 3,474 lines): must run as a
    shadow first, comparing decisions against the Python scheduler on the same traffic
    before anything is cut over.
@@ -178,6 +198,7 @@ torch path.
 ```bash
 export PATH="$PWD/.venv/bin:$PATH"
 bash tools/check_prefix_hash_parity.sh --num-blocks 200   # also runs the crate's unit tests
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --pool-blocks 24
 
 python3 tools/gen_prefix_hash_corpus.py --out-dir /tmp/hashbench \
   --num-blocks 10000 --block-size 32 --vocab-size 248320 --seed 0 --bench-trials 5

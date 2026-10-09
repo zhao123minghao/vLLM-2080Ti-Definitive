@@ -74,13 +74,20 @@ bash tools/check_prefix_hash_parity.sh --num-blocks 200
   `resolve_block_hashes` 的每个分支（尺寸相同、已是视图、细粒度部分命中保留原始哈希、
   以及整除断言）。这在本部署上不是纸面问题：跑的是混合模型，各 KV cache 组的块大小
   并不都等于 `hash_block_size`。
+* 池上的 KV 缓存**事件队列**与**指标收集器**——池驱动的两个可选观察者。`BlockRemoved`
+  （被驱逐的哈希、其 4 字节组 id 已被剥离、它携带的组 id，以及介质）与 `AllBlocksCleared`
+  按入队顺序排队，由 `take_events()` 整体交出；收集器为每个已分配块保留一条访问历史（上限
+  4 个样本）、统计驱逐事件数、随池一起重置，并在 `drain_events()` 时交出其待处理事件。有两处
+  刻意不比较：`take_events()` 在 `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES` 下把哈希字节改写成
+  整数（校验脚本把它关掉，双方打印的都是池自己的字节），以及收集器记录的墙钟时长
+  （`sample_rate=1.0` 让采样无任何可判定空间，而时长本身不可复现）。
 
 `tools/check_block_pool_parity.sh` 把哈希那套方法变成了生成器：
 
 ```bash
 bash tools/check_block_pool_parity.sh
-bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
-# -> block_pool_parity_ok traces=6 operations=7300
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --pool-blocks 24
+# -> block_pool_parity_ok traces=12 operations=8602
 ```
 
 `tools/gen_block_pool_trace.py` 用带种子的随机操作序列驱动**真实的** Python 类，同时写出操作
@@ -88,13 +95,21 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
 重放同一轨迹，两份日志做 diff。扫多个种子是它区别于单元测试的关键：真正考验重写是否漂移的
 地方，恰恰是那些**拒绝路径**也能一一对应。
 
-已验证：6 条轨迹、每条约 1,217 步（**共比较 7,300 步，其中 3,640 步是池操作、1,428 步是哈希
-列表操作，810 步被 Python 拒绝**：435 `ValueError`、244 `AssertionError`、131 `IndexError`），
-日志逐行一致，包括每次拒绝所报的异常类型。crate 自带 23 个单测锁住 diff 看不到的部分——被弹出
-的块确实不再持有任何指针、映射只在最后一个块被弹出时才删键、null 块永不参与分配。
+每个种子会跑两轮：一轮关闭事件队列与指标收集器，一轮两者全开，这样“关闭态”的行为也被钉住
+（关闭态下 `take_events` 永远是空、`drain_metrics` 永远返回 `0`、`metrics=none`）。开启事件后，
+校验会改成一次只驱逐一个块，而不再传一组：`BlockPool.evict_blocks` 接受 `set[int]`，Python 按
+集合迭代顺序遍历，因此一次多块调用所入队事件的**顺序**属于 CPython 集合布局的实现细节，移植版
+无法复现。多块形式保留在不产生任何事件的关闭态轮次里。
 
-尚未覆盖的部分：KV 缓存事件队列、指标收集器、`BlockPool` 中依赖 `Request` 的入口
-（`cache_full_blocks`、`cache_partial_block`），以及池之上的调度器决策。
+已验证：6 个种子 × 2 种模式、每轮约 717 步（**共比较 8,602 步，730 步被 Python 拒绝**：271
+`ValueError`、276 `AssertionError`、183 `IndexError`），日志逐行一致，包括每次拒绝所报的异常
+类型。事件与指标那一半贡献了 107 步 `take_events`、98 步 `drain_metrics`、226 个入队事件 token
+（223 个 `removed:`、3 个 `cleared:`）以及 75 份 `pool_dump` 快照，其中 55 份的驱逐计数非零。
+crate 自带 26 个单测锁住 diff 看不到的部分——被弹出的块确实不再持有任何指针、映射只在最后一个
+块被弹出时才删键、null 块永不参与分配。
+
+尚未覆盖的部分：`BlockPool` 中依赖 `Request` 的入口（`cache_full_blocks`、
+`cache_partial_block`）、它们发出的 `BlockStored` 事件，以及池之上的调度器决策。
 
 ## 为什么这不是一个性能项目
 
@@ -114,7 +129,7 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
 
 建议顺序如下：
 
-1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图与 `BlockPool` 本体均已移植并通过影子校验（见上文）；这一步剩下的是 KV 缓存事件队列、指标收集器，以及依赖 `Request` 的 `cache_full_blocks` / `cache_partial_block` 入口。真正的语义风险在这里，不在哈希。
+1. **块池**（`block_pool.py`、`FreeKVCacheBlockQueue`、`KVCacheBlock`、`BlockHashListWithBlockSize`）：调度器每步都会改动的可变状态。空闲链表、哈希映射、块大小视图、KV 缓存事件队列、指标收集器与 `BlockPool` 本体均已移植并通过影子校验（见上文）；这一步剩下的是依赖 `Request` 的 `cache_full_blocks` / `cache_partial_block` 入口以及它们发出的 `BlockStored` 事件。真正的语义风险在这里，不在哈希。
 2. **调度决策**（`sched/scheduler.py`，自身 3,474 行）：必须先以影子模式运行，在同一条流量上把决策序列与 Python 调度器对比，之后才谈切换。
 3. 把 Rust 侧调度器放到 `managed-engine` / M3–M4 的进程工作之后，最后才把 Python 收缩为执行已决定批次的 worker。
 
@@ -125,6 +140,7 @@ bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 1200
 ```bash
 export PATH="$PWD/.venv/bin:$PATH"
 bash tools/check_prefix_hash_parity.sh --num-blocks 200   # 同时会跑 crate 单测
+bash tools/check_block_pool_parity.sh --seeds 6 --num-ops 700 --key-space 8 --pool-blocks 24
 
 python3 tools/gen_prefix_hash_corpus.py --out-dir /tmp/hashbench \
   --num-blocks 10000 --block-size 32 --vocab-size 248320 --seed 0 --bench-trials 5

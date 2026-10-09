@@ -82,17 +82,30 @@ recorded operation trace:
   `unpin` with its reuse watchers, eviction on allocation, the per-block hash metadata and
   the reset path — and `BlockHashListWithBlockSize` plus `resolve_block_hashes`, the
   block-size-aware view the scheduler reads hashes through (index arithmetic, Python slice
-  normalisation, negative indices, and the fine-grained-partial-hit branch). The failure
+  normalisation, negative indices, and the fine-grained-partial-hit branch). The pool's two
+  optional observers are ported as well: the KV-cache event queue (`BlockRemoved` with the
+  evicted hash, its group id and the medium, plus `AllBlocksCleared`, drained by `take_events()`)
+  and the deterministic half of `KVCacheMetricsCollector` (one access history per allocated
+  block capped at four samples, eviction events, reset, `drain_events()`). The failure
   modes are part of the contract: `ValueError`, `AssertionError`, `RuntimeError` and
   `IndexError` are reproduced as the exception Python would have raised, and the free-block
   counter is signed because Python's `int` can drift negative.
 - New `tools/check_block_pool_parity.sh` plus `tools/gen_block_pool_trace.py`: the recorder
   drives the **real** Python classes with a seeded random operation sequence and writes the
   trace together with the log Python produced, including the exception class of every
-  rejected operation; the Rust binary replays the trace and the two logs are diffed.
-  Verified with 6 traces of ~1,217 operations: **7,300 operations compared, 3,640 of them pool
-  operations and 1,428 hash-list operations, 810 rejections, every line identical**, plus 23
-  crate unit tests for what a log diff cannot see.
+  rejected operation; the Rust binary replays the trace and the two logs are diffed. Each seed
+  runs twice — with the event queue and the metrics collector off, and with both on — so the
+  disabled paths stay pinned. Verified with 6 seeds × 2 modes of ~717 operations: **12 traces,
+  8,602 operations compared, 730 rejections, every line identical**, including 107
+  `take_events` and 98 `drain_metrics` operations with 226 queued event tokens, plus 26 crate
+  unit tests for what a log diff cannot see.
+- Two parts of the event path are deliberately outside the comparison, and both are labelled as
+  such: `take_events()` rewrites the block hash bytes into integers unless
+  `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` (the harness switches it off so both sides print the
+  pool's own bytes), and the collector's recorded durations are wall-clock. A third is avoided
+  by construction: with events enabled the harness evicts one block per call, because
+  `BlockPool.evict_blocks` takes a `set[int]` and the order of the events a multi-id call queues
+  is CPython set-layout detail.
 
 ### One-command validation
 

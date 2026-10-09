@@ -14,8 +14,12 @@
 #
 # Usage:
 #   bash tools/check_block_pool_parity.sh [--seeds N] [--num-ops N] [--num-blocks N]
-#                                         [--key-space N] [--pool-blocks N]
-#                                         [--pool-caching 0|1] [--skip-build] [--skip-tests]
+#                                         [--key-space N] [--pool-blocks N] [--pool-caching 0|1]
+#                                         [--pool-events 0|1] [--pool-metrics 0|1]
+#                                         [--skip-build] [--skip-tests]
+#
+# Every seed is replayed twice by default: once with the KV-cache event queue and the metrics
+# collector off, and once with both on. Passing either knob runs exactly that one mode.
 #
 # Exits non-zero on the first mismatch (the diff is printed).
 
@@ -39,6 +43,9 @@ NUM_BLOCKS=16
 KEY_SPACE=6
 POOL_BLOCKS=24
 POOL_CACHING=1
+# `-` means "not requested", which selects the two-mode sweep built below.
+POOL_EVENTS="-"
+POOL_METRICS="-"
 SKIP_BUILD=0
 SKIP_TESTS=0
 
@@ -50,9 +57,11 @@ while [[ $# -gt 0 ]]; do
     --key-space) KEY_SPACE="$2"; shift 2 ;;
     --pool-blocks) POOL_BLOCKS="$2"; shift 2 ;;
     --pool-caching) POOL_CACHING="$2"; shift 2 ;;
+    --pool-events) POOL_EVENTS="$2"; shift 2 ;;
+    --pool-metrics) POOL_METRICS="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
-    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -102,33 +111,51 @@ traces=0
 operations=0
 failures=0
 
-for seed in $(seq 0 $((SEEDS - 1))); do
-  dir="$WORK_DIR/seed-$seed"
-  generated="$("$PYTHON" tools/gen_block_pool_trace.py \
-    --out-dir "$dir" \
-    --num-blocks "$NUM_BLOCKS" \
-    --num-ops "$NUM_OPS" \
-    --key-space "$KEY_SPACE" \
-    --pool-blocks "$POOL_BLOCKS" \
-    --pool-caching "$POOL_CACHING" \
-    --seed "$seed")"
-  ops="$(printf '%s\n' "$generated" | awk -F': ' '/^operations:/ {print $2}')"
-  operations=$((operations + ops))
+# Each seed runs once per mode. The two-mode default keeps the extra-hash cases in play (with
+# events enabled a block is limited to one cached hash, see the generator) while the event and
+# metric paths get a pass of their own.
+modes=("0 0" "1 1")
+if [[ "$POOL_EVENTS" != "-" || "$POOL_METRICS" != "-" ]]; then
+  modes=("${POOL_EVENTS/-/0} ${POOL_METRICS/-/0}")
+fi
 
-  if "$RUST_BIN" replay --trace "$dir/trace.txt" > "$dir/rust.txt" \
-    && diff -q "$dir/expected.txt" "$dir/rust.txt" > /dev/null; then
-    echo "[pool-parity] PASS seed=$seed ops=$ops (python == rust)"
-  else
-    echo "[pool-parity] FAIL seed=$seed ops=$ops" >&2
-    diff -u "$dir/expected.txt" "$dir/rust.txt" | head -30 >&2
-    failures=$((failures + 1))
-  fi
-  traces=$((traces + 1))
+for mode in "${modes[@]}"; do
+  read -r pool_events pool_metrics <<< "$mode"
+  mode_dir="$WORK_DIR/events-$pool_events-metrics-$pool_metrics"
+  for seed in $(seq 0 $((SEEDS - 1))); do
+    dir="$mode_dir/seed-$seed"
+    generated="$("$PYTHON" tools/gen_block_pool_trace.py \
+      --out-dir "$dir" \
+      --num-blocks "$NUM_BLOCKS" \
+      --num-ops "$NUM_OPS" \
+      --key-space "$KEY_SPACE" \
+      --pool-blocks "$POOL_BLOCKS" \
+      --pool-caching "$POOL_CACHING" \
+      --pool-events "$pool_events" \
+      --pool-metrics "$pool_metrics" \
+      --seed "$seed")"
+    ops="$(printf '%s\n' "$generated" | awk -F': ' '/^operations:/ {print $2}')"
+    operations=$((operations + ops))
+
+    if "$RUST_BIN" replay --trace "$dir/trace.txt" > "$dir/rust.txt" \
+      && diff -q "$dir/expected.txt" "$dir/rust.txt" > /dev/null; then
+      echo "[pool-parity] PASS events=$pool_events metrics=$pool_metrics seed=$seed ops=$ops (python == rust)"
+    else
+      echo "[pool-parity] FAIL events=$pool_events metrics=$pool_metrics seed=$seed ops=$ops" >&2
+      diff -u "$dir/expected.txt" "$dir/rust.txt" | head -30 >&2
+      failures=$((failures + 1))
+    fi
+    traces=$((traces + 1))
+  done
 done
 
-errors="$(grep -ac ' -> err ' "$WORK_DIR"/seed-*/expected.txt | awk -F: '{s += $2} END {print s}' || true)"
+errors="$(grep -ac ' -> err ' "$WORK_DIR"/events-*/seed-*/expected.txt | awk -F: '{s += $2} END {print s + 0}' || true)"
+event_ops="$(grep -ac '^pool_take_events' "$WORK_DIR"/events-*/seed-*/expected.txt | awk -F: '{s += $2} END {print s + 0}' || true)"
+metric_ops="$(grep -ac '^pool_drain_metrics' "$WORK_DIR"/events-*/seed-*/expected.txt | awk -F: '{s += $2} END {print s + 0}' || true)"
+event_tokens="$(grep -aho 'removed:[0-9a-f]*:[0-9]*:[A-Z]*\|cleared:[A-Z]*' "$WORK_DIR"/events-*/seed-*/expected.txt | wc -l)"
 echo "[pool-parity] artifacts: $WORK_DIR"
 echo "[pool-parity] operations compared: $operations ($errors rejected by Python)"
+echo "[pool-parity] event/metric operations: $event_ops take_events, $metric_ops drain_metrics ($event_tokens event token(s))"
 if [[ "$failures" != "0" ]]; then
   echo "block_pool_parity_failed traces=$traces failures=$failures" >&2
   exit 1
