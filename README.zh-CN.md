@@ -126,6 +126,7 @@ NON_INTERACTIVE=1 ./launcher.sh
 bash tools/validate_all.sh                 # 静态检查：bash -n、py_compile、profile 矩阵、空白字符
 bash tools/validate_all.sh --with-parity   # 另加跨语言一致性（前缀哈希、块簿记）
 bash tools/validate_all.sh --with-chat     # 另加真实路由上的对话回归
+bash tools/validate_all.sh --with-audit    # 另加依赖审计与实测版本清单核对
 bash tools/validate_all.sh --full          # 以上全部
 ```
 

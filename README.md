@@ -136,6 +136,7 @@ scheduler, run the checks that apply:
 bash tools/validate_all.sh                 # static: bash -n, py_compile, profile matrix, whitespace
 bash tools/validate_all.sh --with-parity   # + cross-language parity (prefix hash, block pool)
 bash tools/validate_all.sh --with-chat     # + chat regression on a live route
+bash tools/validate_all.sh --with-audit    # + dependency audit and the measured pin set
 bash tools/validate_all.sh --full          # everything above
 ```
 

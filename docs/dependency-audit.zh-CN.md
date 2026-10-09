@@ -166,6 +166,9 @@ bash tools/dep_audit.sh --out-dir /tmp/dep-before -- \
 脚本会打印报告路径；每个进程的原始快照保留在 `<out-dir>/snapshots/`，因此可以对两次运行
 做逐模块对比。
 
+`bash tools/validate_all.sh --with-audit` 会对参考路由跑同一套审计（自己启停服务），随后执行
+下面的最小集检查——依赖改动应该通过这一条命令验收。
+
 ## 环境剪裁（实测最小依赖集）
 
 审计说明了运行时加载什么；据此可以真正地剪裁部署环境并验证结果。

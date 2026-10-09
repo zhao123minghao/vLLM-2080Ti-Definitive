@@ -65,6 +65,7 @@ optional checks below:
 bash tools/validate_all.sh                 # the four static steps above
 bash tools/validate_all.sh --with-parity   # + the cross-language parity checks
 bash tools/validate_all.sh --with-chat     # + the chat regression
+bash tools/validate_all.sh --with-audit    # + the dependency audit and minimal-set check
 bash tools/validate_all.sh --full          # all of them
 ```
 
@@ -101,7 +102,8 @@ bash tools/chat_smoke.sh --launch --quick
 
 For dependency, requirement or environment changes (adding, pruning or replacing packages),
 re-run the audit and check the measured pin set against it; `check_minimal_set.py` fails when
-a distribution the run loaded is missing from the pin file:
+a distribution the run loaded is missing from the pin file. `validate_all.sh --with-audit`
+runs exactly this pair, launching and stopping the reference route itself:
 
 ```bash
 bash tools/dep_audit.sh --out-dir /tmp/dep-audit -- <launcher args...>

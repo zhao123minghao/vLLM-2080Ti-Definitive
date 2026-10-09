@@ -4,6 +4,23 @@ This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately fro
 
 ## Unreleased
 
+### Dependency audit in the one-command validator
+
+The audit step of the publishing checklist is now part of the one-command validator, and the
+audit tool can actually run unattended:
+
+- `tools/validate_all.sh --with-audit` runs the dependency audit against the reference route and
+  then `check_minimal_set.py`, so the measured pin set is checked by the same command as
+  everything else; `--full` now includes it. Verified: `validate_all_ok steps=5 failed=0`,
+  `dep_audit_ok snapshots=13`, `OK: every loaded distribution is covered by the requirement
+  file`.
+- `tools/dep_audit.sh` manages the service lifecycle itself: it holds the launcher's stdin open
+  (a non-interactive launcher never returns on its own, which previously left the script waiting
+  forever before the analysis and, when interrupted, produced no report at all), waits for
+  `/health` on the `--port` it parses out of the forwarded launcher arguments, stops the service,
+  and only then analyses the snapshots. `AUDIT_READY_TIMEOUT` bounds the wait. The audit hook is
+  exported for the launcher only, so the analyser does not snapshot its own imports.
+
 ### KV-cache block bookkeeping: Rust shadow verification
 
 The second step of the `v1/core` migration spike (after prefix-cache hashing) ports the block

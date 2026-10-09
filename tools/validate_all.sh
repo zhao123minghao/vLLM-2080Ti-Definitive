@@ -8,6 +8,7 @@
 #   bash tools/validate_all.sh                 # static checks only, a few seconds
 #   bash tools/validate_all.sh --with-parity   # + the cross-language parity checks (need cargo)
 #   bash tools/validate_all.sh --with-chat     # + chat regression (starts and stops the route)
+#   bash tools/validate_all.sh --with-audit    # + dependency audit and minimal-set check
 #   bash tools/validate_all.sh --full          # everything above
 #
 # Extra arguments that are not options are compiled as Python along with `tools/**/*.py`,
@@ -32,13 +33,15 @@ export PATH="$REPO_ROOT/.venv/bin:$PATH"
 
 WITH_PARITY=0
 WITH_CHAT=0
+WITH_AUDIT=0
 EXTRA_PY=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-parity) WITH_PARITY=1; shift ;;
     --with-chat) WITH_CHAT=1; shift ;;
-    --full) WITH_PARITY=1; WITH_CHAT=1; shift ;;
+    --with-audit) WITH_AUDIT=1; shift ;;
+    --full) WITH_PARITY=1; WITH_CHAT=1; WITH_AUDIT=1; shift ;;
     -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown argument: $1" >&2; exit 2 ;;
     *) EXTRA_PY+=("$1"); shift ;;
@@ -104,6 +107,34 @@ fi
 # ------------------------------------------------------- optional: chat regression (live)
 if [[ "$WITH_CHAT" == "1" ]]; then
   run_step "chat_smoke.sh --launch --quick" bash tools/chat_smoke.sh --launch --quick
+fi
+
+# ---------------------------------------------------- optional: dependency audit (live)
+#
+# Measures what a real serving run actually loads and checks the result against
+# `requirements/definitive-2080ti-measured.txt`. `dep_audit.sh` starts and stops the reference
+# route itself; the launcher arguments below mirror `tools/chat_smoke.sh` and are meant to stay
+# in sync with it.
+run_audit() {
+  local out_dir="/tmp/dep-audit-validate-all"
+  rm -rf "$out_dir"
+  bash tools/dep_audit.sh --out-dir "$out_dir" -- \
+    --non-interactive \
+    --model-dir "${VALIDATE_AUDIT_MODEL_DIR:-/data/models/qwen3.8-27b/Qwen3.8-27B-FP8}" \
+    --speculative-model "${VALIDATE_AUDIT_SPEC_MODEL:-/data/models/qwen3.8-27b/MTP}" \
+    --served-name "${VALIDATE_AUDIT_SERVED_NAME:-Qwen3.8-27B-FP8}" \
+    --profile "${VALIDATE_AUDIT_PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp16kv-1x148K-text-only.env}" \
+    --mode fast \
+    --gpu-devices "${VALIDATE_AUDIT_GPU_DEVICES:-0,1}" \
+    --tp-size "${VALIDATE_AUDIT_TP_SIZE:-2}" \
+    --port "${VALIDATE_AUDIT_PORT:-8000}" \
+    --set START_TIMEOUT=420 \
+    --set MAX_MODEL_LEN=131072 || return 1
+  python3 tools/dep_audit/check_minimal_set.py --report "$out_dir/report.json"
+}
+
+if [[ "$WITH_AUDIT" == "1" ]]; then
+  run_step "dep_audit.sh + check_minimal_set.py" run_audit
 fi
 
 echo "[validate] steps=${steps} failed=${failures} skipped=${skipped}"

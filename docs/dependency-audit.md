@@ -181,6 +181,10 @@ bash tools/dep_audit.sh --out-dir /tmp/dep-before -- \
 The wrapper prints the report path; the raw per-process snapshots stay under
 `<out-dir>/snapshots/` so two runs can be diffed module by module.
 
+`bash tools/validate_all.sh --with-audit` runs this same audit against the reference route
+(launching and stopping the service itself) and then the minimal-set check below, which is how
+a dependency change is supposed to be validated end to end.
+
 ## Pruning the environment (measured minimal set)
 
 The audit says what a run loads; that made it possible to actually prune the deployment
